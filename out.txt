@@ -1,0 +1,4 @@
+make -C kernel
+make[1]: Entering directory '/osdev/AntOS_Project/AntOS_Kernel/kernel'
+cargo build --target x86_64-unknown-none --profile dev
+make[1]: Leaving directory '/osdev/AntOS_Project/AntOS_Kernel/kernel'
