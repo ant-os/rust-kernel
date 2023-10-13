@@ -1,7 +1,7 @@
-pub mod character;
-pub mod network;
-pub mod input;
 pub mod block;
+pub mod character;
+pub mod input;
+pub mod network;
 
 pub enum Device<'r> {
     Character(&'r dyn character::UnsafeCharacterDevice),

@@ -1,3 +1,1 @@
-
-
-pub trait UnsafeBlockDevice{}
+pub trait UnsafeBlockDevice {}

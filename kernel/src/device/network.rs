@@ -1,2 +1,1 @@
-
-pub trait UnsafeNetworkDevice{}
+pub trait UnsafeNetworkDevice {}

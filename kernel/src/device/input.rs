@@ -1,2 +1,1 @@
-
-pub trait UnsafeInputDevice{}
+pub trait UnsafeInputDevice {}
