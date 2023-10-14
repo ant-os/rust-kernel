@@ -6,6 +6,8 @@
 #![feature(core_intrinsics)]
 #![feature(decl_macro)]
 #![feature(ptr_from_ref)]
+#![feature(inherent_associated_types)]
+#![feature(adt_const_params)]
 
 pub mod bitmap_font;
 pub mod common;
@@ -26,6 +28,7 @@ use core::arch::asm;
 use core::intrinsics::{likely, unlikely};
 #[macro_use]
 use core::fmt::*;
+use crate::paging::pf_allocator;
 
 static TERMINAL_REQUEST: limine::TerminalRequest = limine::TerminalRequest::new(0);
 static MEMMAP_REQUEST: limine::MemmapRequest = limine::MemmapRequest::new(0);
@@ -45,6 +48,12 @@ pub fn integer_to_string<'_str, I: itoa::Integer>(value: I) -> &'_str str {
     assign_uninit! { ITOA_BUFFER (itoa::Buffer) <= { itoa::Buffer::new() } }
 
     unsafe { (*(*buf).as_mut_ptr()).format::<I>(value) }
+}
+
+struct Person {
+    id: i32,
+    age: i32,
+    name: &'static str,
 }
 
 #[no_mangle]
@@ -90,6 +99,12 @@ unsafe extern "C" fn _start<'_kernel>() -> ! {
     }
 
     DEBUG_LINE.unsafe_write_line("TEST");
+
+    let mut page = pf_allocator!().request_safe_page();
+
+    let page_as_person: &mut Person = &mut *page.unchecked_raw_transmute::<Person>();
+
+    debug!("TEST");
 
     hcf();
 }

@@ -1,3 +1,4 @@
+pub mod consts;
 pub mod io;
 pub mod macros;
 pub use limine::*;
@@ -38,6 +39,76 @@ macro_rules! debug{
         );
         *
     }
+    }
+}
+
+pub unsafe fn _alloc_mut_t<T: Sized>() -> *mut T {
+    if (core::intrinsics::size_of::<T>() > crate::consts::PAGE_SIZE as usize) {
+        unimplemented!();
+    }
+
+    unsafe {
+        core::intrinsics::transmute::<*mut (), *mut T>(
+            crate::pf_allocator!().request_page().unwrap() as *mut (),
+        )
+    }
+}
+
+#[macro_export]
+macro_rules! pf_alloc_syn{
+    { alloc $name:ident = $typ:ty {$($fname:ident: $fval:expr),*} } => {
+        let mut $name = &mut *(_alloc_mut_t::<$typ>());
+
+        $(
+            $name.$fname = ($fval);
+        )
+        *
+    }
+}
+
+#[allow(missing_fragment_specifier)]
+#[macro_export]
+macro_rules! make_wrapper {
+    { ( $name:ident($($arg_name:ident: $arg_type:ty), *) ==> $target_name:ident) for $typ:ty[<$success:ty, $error:ty>] @ uninit_err = $uninit_variant:expr } => {
+        pub fn $name(&mut self, $($arg_name:$arg_type),*) -> Result<$success, $error> {
+            if !self.is_initialized() {
+                return Err($uninit_variant);
+            } else {
+                return self.$target_name($($arg_name),*);
+            }
+        }
+    }
+}
+
+#[allow(missing_fragment_specifier)]
+#[macro_export]
+macro_rules! split_and_invoke_macro{
+    {$_macro:path; $($code:block),*}=> {
+        $(
+            $_macro! { $code }
+        )
+        *
+    }
+}
+
+#[macro_export]
+macro_rules! return_if_let {
+    (($boolean_wrapper:expr) => $variant:path) => {
+        if let Some(_boolean) = $boolean_wrapper {
+            _boolean
+        } else {
+            return Err($variant);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! extra_features{
+    {for (_, $condition:expr, $update:expr)$code:block} => {
+        while $condition{
+            $code
+            $update;
+        }
     }
 }
 
