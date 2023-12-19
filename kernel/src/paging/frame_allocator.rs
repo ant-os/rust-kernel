@@ -1,4 +1,4 @@
-use core::ptr::NonNull;
+use core::{ptr::NonNull, sync::atomic::AtomicPtr};
 
 use crate::{
     consts::{INVALID_PAGE_STATE, PAGE_SIZE},
@@ -408,21 +408,27 @@ impl PageFrameAllocator {
     }
 }
 
-pub struct PtrWrapper<T: ?Sized>(*mut T);
+pub struct PtrWrapper<T: ?Sized>{
+    pub(self) inner: NonNull<T>
+}
+
+unsafe impl<T: ?Sized> Sync for PtrWrapper<T> {}
+unsafe impl<T: ?Sized> Send for PtrWrapper<T> {}
+
 
 impl<T: ?Sized> PtrWrapper<T> {
     pub unsafe fn from_raw(_val: &mut T) -> PtrWrapper<T> {
-        Self(&mut *_val as *mut T)
+        Self { inner: NonNull::new(_val).unwrap() }
     }
 }
 
 impl bitmap::Storage for PtrWrapper<[usize]> {
     fn as_ref(&self) -> &[usize] {
-        unsafe { &*self.0 }
+        unsafe { self.inner.as_ref() }
     }
 
     fn as_mut(&mut self) -> &mut [usize] {
-        unsafe { &mut *self.0 }
+        unsafe { self.inner.as_mut() }
     }
 }
 

@@ -58,11 +58,11 @@ impl KernelAllocator{
 
     pub fn initialize(&mut self) -> Result<(), frame_allocator::Error>{
         let size = self.size.load(SeqCst);
-        let arena = pf_allocator!().request_memory_area(size)?;
+        let arena = pf_allocator().request_memory_area(size)?;
 
         self.is_initialized.store(true, SeqCst);
 
-      //  log::info!("Kernel Allocator Initialized! Initial allocator arena size: {}\n(\n{:#?}\n)\n", type_name_of_val(&self.size), self.size.load(SeqCst));
+        // log::info!("Kernel Allocator Initialized! Initial allocator arena size: {}\n(\n{:#?}\n)\n", type_name_of_val(&self.size), self.size.load(SeqCst));
 
         Ok(())
     }

@@ -3,7 +3,7 @@
 use core::{arch::asm, alloc::Layout, sync::atomic::AtomicPtr};
 use bitflags::bitflags;
 
-use crate::{alloc_impl::KERNEL_ALLOCATOR, PAGE_TABLE_MANAGER, paging::pt_manager, memory::{VirtualAddress, PhysicalAddress}};
+use crate::{alloc_impl::KERNEL_ALLOCATOR, paging::pt_manager};
 
 const GDT_KERNEL_CODE: u16 = 0x8;
 
