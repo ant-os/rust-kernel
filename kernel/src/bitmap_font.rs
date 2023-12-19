@@ -8,12 +8,12 @@ macro_rules! include_font {
     };
 }
 
-pub trait BitmapCharImpl {
+pub trait DisplayChar {
     fn is_set(&self, x: usize, y: usize) -> bool;
 }
 
-impl BitmapCharImpl for BitmapChar {
+impl DisplayChar for BitmapChar {
     fn is_set(&self, x: usize, y: usize) -> bool {
-        (self[x] & 1 << (y as i8)) != 0
+        (self[y] & 1 << (x as i8)) != 0
     }
 }

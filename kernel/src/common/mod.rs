@@ -2,6 +2,9 @@ pub mod consts;
 pub mod io;
 pub mod macros;
 pub use limine::*;
+pub mod idt;
+pub mod gdt;
+
 
 pub type Unit = ();
 
@@ -23,6 +26,29 @@ macro_rules! decl_uninit {
     };
 }
 
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed(2))]
+pub struct DescriptorTablePointer {
+    /// Size of the DT.
+    pub limit: u16,
+    /// Pointer to the memory region containing the DT.
+    pub base: u64,
+}
+
+#[inline]
+pub unsafe fn lidt(ptr: &DescriptorTablePointer) {
+    unsafe {
+        core::arch::asm!("lidt [{}]", in(reg) ptr, options(readonly, nostack, preserves_flags));
+    }
+}
+
+#[inline]
+pub unsafe fn lgdt(ptr: &DescriptorTablePointer) {
+    unsafe {
+        core::arch::asm!("lgdt [{}]", in(reg) ptr, options(readonly, nostack, preserves_flags));
+    }
+}
+
 #[macro_export]
 macro_rules! assign_uninit{
     {$name:ident($typ:ty) <= $val:expr} =>{
@@ -42,22 +68,43 @@ macro_rules! debug{
     }
 }
 
-pub unsafe fn _alloc_mut_t<T: Sized>() -> *mut T {
-    if (core::intrinsics::size_of::<T>() > crate::consts::PAGE_SIZE as usize) {
-        unimplemented!();
-    }
+#[macro_export]
+macro_rules! kprint{
+    ($($msg:expr),*) => {
+        unsafe{
+        $(
+            crate::KERNEL_CONSOLE.write_str($msg);
+        );
+        *
 
-    unsafe {
-        core::intrinsics::transmute::<*mut (), *mut T>(
-            crate::pf_allocator!().request_page().unwrap() as *mut (),
-        )
+        crate::KERNEL_CONSOLE.newline();
     }
+    }
+}
+
+#[macro_export]
+macro_rules! debug_err{
+    ($($msg:expr),*) => {
+        debug!("ERROR: ", $($msg), *)
+    }
+}
+
+pub unsafe fn _alloc_frame_as_mut_t<T: Sized>() -> Result<*mut T, super::paging::frame_allocator::Error> {
+   /* if (core::intrinsics::size_of::<T>() > (crate::consts::PAGE_SIZE + 1) as usize) {
+        unimplemented!();
+    }*/
+
+    Ok(unsafe {
+        core::intrinsics::transmute_unchecked::<*mut (), *mut T>(
+            crate::pf_allocator!().request_page()? as *mut (),
+        )
+    })
 }
 
 #[macro_export]
 macro_rules! pf_alloc_syn{
     { alloc $name:ident = $typ:ty {$($fname:ident: $fval:expr),*} } => {
-        let mut $name = &mut *(_alloc_mut_t::<$typ>());
+        let mut $name = &mut *(_alloc_frame_as_mut_t::<$typ>());
 
         $(
             $name.$fname = ($fval);
@@ -113,5 +160,5 @@ macro_rules! extra_features{
 }
 
 pub macro endl() {
-    "\n\r"
+    "\n"
 }

@@ -69,19 +69,6 @@ impl PageFrameAllocator {
             total_memory += entry.len;
         }
 
-        debug!(
-            crate::integer_to_string(largest_free_segment_size / crate::consts::PAGE_SIZE / 8),
-            endl!()
-        );
-
-        debug!(
-            crate::integer_to_string(total_memory / crate::consts::PAGE_SIZE / 8),
-            " vs "
-        );
-        debug!(
-            crate::integer_to_string(total_memory / crate::consts::PAGE_SIZE),
-            endl!()
-        );
 
         let mut bitmap = unsafe {
             &mut *Self::place_bitmap_in_segment(
@@ -92,10 +79,6 @@ impl PageFrameAllocator {
         };
 
         bitmap.set(10, 1);
-
-        debug!(crate::integer_to_string(
-            bitmap.get(10).unwrap_or(INVALID_PAGE_STATE)
-        ));
 
         let mut _self = PageFrameAllocator {
             bitmap: bitmap,
@@ -141,7 +124,6 @@ impl PageFrameAllocator {
         };
 
         if let Some(_seg) = segment {
-            // This actually works...
             crate::assign_uninit! { _BITMAP (PageBitmap) <= unsafe {
                 PageBitmap::from_storage(
                     pages + 1,
@@ -283,7 +265,7 @@ impl PageFrameAllocator {
     decl_multi_page_fn! { [pub] free_pages => free_page (...) }
 
     pub fn lock_page(&mut self, addr: usize) -> Result<(), Error> {
-        let index: usize = (addr / crate::consts::PAGE_SIZE as usize);
+        let index: usize = addr / crate::consts::PAGE_SIZE as usize;
         let state = self.bitmap.get(addr).unwrap_or(INVALID_PAGE_STATE);
 
         return match state {
@@ -370,8 +352,9 @@ impl PageFrameAllocator {
     //crate::make_wrapper! { ( free_page(addr:usize) ==> _internal_free_page ) for Self[<(), Error>] @ uninit_err = Error::UninitializedAllocator }
     // crate::make_wrapper! { ( free_pages(addr:usize, num:usize) ==> _internal_free_pages ) for Self[<(), Error>] @ uninit_err = Error::UninitializedAllocator  }
 
-    pub fn request_safe_page<'a>(&mut self) -> super::SafePagePtr {
-        unsafe { super::SafePagePtr::unsafe_from_addr(self.request_page().unwrap()) }
+    /// Safe version of `request_page`.
+    pub fn request_safe_page<'a>(&mut self) -> Result<super::SafePagePtr, Error> {
+        Ok(unsafe { super::SafePagePtr::unsafe_from_addr(self.request_page()?) })
     }
 }
 
