@@ -38,8 +38,9 @@ impl<T: Sized> Deref for AtomicRef<T> {
 pub(crate) unsafe trait TransmuteIntoPointer{
     /// Calls [core::intrinsics::transmute_unchecked<Self, *mut T>].
     #[inline(always)]
-    unsafe fn ptr<T: Sized>(self) -> *mut T where Self: Sized{
-        core::intrinsics::transmute::<Self, *mut T>(self)
+    unsafe fn ptr<T: Sized>(self) -> *mut T where Self: Sized,
+    {
+        core::intrinsics::transmute_unchecked::<Self, *mut T>(self)
     }
 }
 
@@ -157,7 +158,7 @@ pub unsafe fn _alloc_frame_as_mut_t<T: Sized>() -> Result<*mut T, super::paging:
 
     Ok(unsafe {
         core::intrinsics::transmute_unchecked::<*mut (), *mut T>(
-            crate::pf_allocator!().request_page()? as *mut (),
+            crate::pf_allocator().request_page()? as *mut (),
         )
     })
 }

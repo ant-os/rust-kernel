@@ -9,18 +9,19 @@ pub mod frame_allocator;
 pub mod table_manager;
 pub mod indexer;
 
-#[deprecated = "This is not thread-safe at all, a better method is work in process."]
-/// UNSAFETY: Get a mutable reference to a static that might not be initialized(**`MaybeUnit`**).
-/// Don't use if you don't know exactly what your doing, even if you do, using this will probably lead to **UB**.
-pub macro pf_allocator() {
-    (unsafe { &mut *crate::PAGE_FRAME_ALLOCATOR.as_mut_ptr() })
+use spin::Mutex;
+use core::cell::UnsafeCell;
+
+/// Get a mutable reference to the [frame_allocator::PageFrameAllocator].
+/// This is now thread-safe and will not lead to undefined behavior.
+pub fn pf_allocator() -> spin::MutexGuard<'static, frame_allocator::PageFrameAllocator> {
+    crate::KERNEL_FRAME_ALLOCATOR.lock()
 }
 
 /// Get the Global [table_manager::PageTableManager].
-/// 
-/// **If a Global Page Table Manager wasn't set using [table_manager::PageTableManager::make_global] this result in undefined behavior!**
-pub macro pt_manager(){
-    & *crate::PAGE_TABLE_MANAGER.as_ptr()
+/// This is now thread-safe and will not lead to undefined behavior.
+pub fn pt_manager() -> spin::MutexGuard<'static, table_manager::PageTableManager> {
+    crate::KERNEL_PAGE_TABLE_MANAGER.lock()
 }
 
 #[must_use]
@@ -72,7 +73,7 @@ impl SafePagePtr {
     #[inline]
     #[must_use]
     pub fn free(&mut self) {
-        pf_allocator!().free_page(self.0).unwrap();
+        pf_allocator().free_page(self.0).unwrap();
     }
 }
 
@@ -85,4 +86,5 @@ impl Drop for SafePagePtr {
 pub use x86_64::structures::paging::page_table::PageTableEntry;
 pub use x86_64::structures::paging::page_table::PageTable;
 
+use self::frame_allocator::PageFrameAllocator;
 pub struct PageFrameMapper;

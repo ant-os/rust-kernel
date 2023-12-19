@@ -3,7 +3,7 @@ use core::{char::UNICODE_VERSION, f64::consts::E, ptr::NonNull};
 use limine::NonNullPtr;
 use x86_64::structures::paging::page_table::PageTableEntry;
 
-use crate::{common::_alloc_frame_as_mut_t, debug, endl, assign_uninit, PAGE_TABLE_MANAGER};
+use crate::{common::_alloc_frame_as_mut_t, debug, endl, assign_uninit};
 
 use super::{indexer::PageMapIndexer, PageTable};
 use crate::memory::{PhysicalAddress, VirtualAddress};
@@ -71,11 +71,6 @@ impl PageTableManager {
         self
     } 
 
-    pub fn make_global(self){
-        assign_uninit!(
-            PAGE_TABLE_MANAGER (PageTableManager) <= self
-        )
-    }
 
     /// Internal Function for Mapping Memory.
     pub(crate) unsafe fn map_memory_internal(

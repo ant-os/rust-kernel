@@ -1,25 +1,31 @@
-#![no_std]
-#![no_main]
-#![allow(deprecated)]
-#![feature(panic_info_message)]
-#![feature(unboxed_closures)]
-#![feature(core_intrinsics)]
-#![feature(decl_macro)]
-#![feature(ptr_from_ref)]
-#![feature(inherent_associated_types)]
-#![feature(adt_const_params)]
-#![feature(abi_x86_interrupt)]
-#![feature(allocator_api)]
-#![feature(const_mut_refs)]
-#![feature(portable_simd)]
-#![feature(strict_provenance)]
-#![feature(sync_unsafe_cell)]
-#![feature(debug_closure_helpers)]
-#![feature(marker_trait_attr)]
-#![feature(asm_const)]
-#![feature(type_name_of_val, rustc_private)]
-#![feature(const_trait_impl)]
 #![recursion_limit = "225"]
+#![cfg_attr(not(test), no_std)]
+#![no_main]
+#![allow(deprecated, incomplete_features, internal_features)]
+#![feature(
+    panic_info_message,
+    unboxed_closures,
+    core_intrinsics,
+    decl_macro,
+    ptr_from_ref,
+    inherent_associated_types,
+    adt_const_params,
+    abi_x86_interrupt,
+    allocator_api,
+    const_mut_refs,
+    portable_simd,
+    strict_provenance,
+    sync_unsafe_cell,
+    debug_closure_helpers,
+    if_let_guard,
+    let_chains,
+    panic_internals,
+    marker_trait_attr,
+    asm_const,
+    type_name_of_val,
+    alloc_internals,
+    lazy_cell,
+)]
 
 extern crate alloc;
 
@@ -28,6 +34,7 @@ pub mod bitmap_font;
 pub mod common;
 pub mod device;
 pub mod framebuffer;
+pub mod graphics;
 pub mod kernel_logger;
 pub mod legacy_pic;
 pub mod memory;
@@ -36,12 +43,13 @@ pub mod renderer;
 pub mod serial;
 pub mod status;
 pub mod tty;
-pub mod graphics;
 use alloc::format;
 use alloc_impl as _;
+use paging::frame_allocator::PageFrameAllocator;
+use spin::Mutex;
 use x86_64::structures::idt::InterruptStackFrame;
 use x86_64::structures::paging::page::PageRange;
-use x86_64::structures::paging::{Mapper, PhysFrame, Size4KiB, Size2MiB, PageTableFlags};
+use x86_64::structures::paging::{Mapper, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
 use x86_64::{structures, PhysAddr, VirtAddr};
 
 use crate::alloc_impl::KERNEL_ALLOCATOR;
@@ -93,12 +101,7 @@ static TEST1: &'static str = "Hello Paging!";
 static TEST2: &'static str = "):";
 
 decl_uninit! {
-    PAGE_FRAME_ALLOCATOR => crate::paging::frame_allocator::PageFrameAllocator,
-    ITOA_BUFFER => itoa::Buffer,
-    KERNEL_CMDLINE => &'static str,
-    KERNEL_PATH => &'static str,
-    PAGE_TABLE_MANAGER => crate::paging::table_manager::PageTableManager,
-    PAGE_MAPPER => x86_64::structures::paging::OffsetPageTable
+    ITOA_BUFFER => itoa::Buffer
 }
 
 lazy_static::lazy_static! {
@@ -119,6 +122,9 @@ lazy_static::lazy_static! {
             panic!("Failed to get the list of System Framebuffers!");
         }
     };
+    static ref KERNEL_FRAME_ALLOCATOR: Mutex<PageFrameAllocator> = Mutex::new(unsafe { PageFrameAllocator::from_response(&*KERNEL_MEMMAP) });
+    static ref KERNEL_PAGE_TABLE_MANAGER: Mutex<PageTableManager> = Mutex::new(PageTableManager::new().expect("Failed to create Page Table Manager."));
+    static ref KERNEL_PAGE_MAPPER: Mutex<x86_64::structures::paging::OffsetPageTable::<'static>> = Mutex::new(unsafe { x86_64::structures::paging::mapper::OffsetPageTable::new(unsafe { active_level_4_table(VirtAddr::zero()) }, VirtAddr::zero())});
     pub(crate) static ref KERNEL_FILE: &'static limine::File = {
         if let Some(resp) = KERNEL_FILE_REQUEST.get_response().get(){
             resp.kernel_file.get::<'static>().unwrap()
@@ -131,8 +137,16 @@ lazy_static::lazy_static! {
     #[doc = "The Area of Memory the Kernel Uses."]
     static ref KERNEL_AREA: MemoryArea = MemoryArea::new(KERNEL_BASE.virtual_base as usize, KERNEL_FILE.length as usize);
     static ref L4_PAGE_TABLE: &'static mut PageTable = unsafe { active_level_4_table(VirtAddr::zero()) };
+    static ref KERNEL_MEMMAP: &'static limine::MemmapResponse = {
+        if let Some(resp) = MEMMAP_REQUEST.get_response().get(){
+            resp
+        }else{
+            debug_err!("Failed to get the list of System Framebuffers!");
+            log::error!("Failed to get the list of System Framebuffers!");
+            panic!("Failed to get the list of System Framebuffers!");
+        }
+    };
 }
-
 
 #[derive(Debug, Clone, Copy)]
 enum OutlineSegment {
@@ -154,9 +168,9 @@ unsafe extern "C" fn __prog_debug_print(__base: *const u8, __len: usize) {
 
 type DbgPrintFn = unsafe extern "C" fn(*const u8, usize);
 
-extern "x86-interrupt" fn handle_pit(_frame: InterruptStackFrame){
-   unsafe { kdebug!("Tick Tock") }
-} 
+extern "x86-interrupt" fn handle_pit(_frame: InterruptStackFrame) {
+    unsafe { kdebug!("Tick Tock") }
+}
 
 #[repr(C)]
 pub struct KernelProgramMeta {
@@ -284,56 +298,9 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
 
     KERNEL_CONSOLE.newline();
 
-    use graphics::{Color, RGBA}; 
-
-    let my_color: Color = Color::from_rgb(255, 255, 255);
-    let my_rgba_color: RGBA = *my_color;
-
     kprint!("Console Successfully Initialized.\n");
 
-    use x86_64::structures::paging::OffsetPageTable;
-
-    assign_uninit!{
-        PAGE_MAPPER (OffsetPageTable) <=  { x86_64::structures::paging::mapper::OffsetPageTable::new(active_level_4_table(VirtAddr::zero()), VirtAddr::zero()) }
-    }
-
     DEBUG_LINE.wait_for_connection();
-
-    let mut total_memory = 0;
-
-    if let Some(memmap_response) = MEMMAP_REQUEST.get_response().get() {
-        DEBUG_LINE.unsafe_write_line("Got Memory Map Response");
-
-        // We use [core::intrinsics::likely] to signal to the compiler that this condition is likely to be true.
-        // Used for Optimization of the code!
-        if core::intrinsics::likely(memmap_response.entry_count > 0) {
-            for (index, entry) in memmap_response.memmap().iter().enumerate() {
-                DEBUG_LINE.unsafe_write_string("MemoryMapEntry { index = ");
-                DEBUG_LINE.unsafe_write_string(integer_to_string(index));
-                DEBUG_LINE.unsafe_write_string(", base = ");
-                DEBUG_LINE.unsafe_write_string(integer_to_string(entry.base));
-                DEBUG_LINE.unsafe_write_string(", length = ");
-                DEBUG_LINE.unsafe_write_string(integer_to_string(entry.len));
-                DEBUG_LINE.unsafe_write_string(", type = \"");
-                DEBUG_LINE.unsafe_write_string(match entry.typ {
-                    MemoryMapEntryType::Usable => "Usable",
-                    MemoryMapEntryType::Reserved => "Reserved",
-                    MemoryMapEntryType::KernelAndModules | MemoryMapEntryType::Framebuffer => {
-                        "Kernel/Framebuffer"
-                    }
-                    _ => "Other",
-                });
-                DEBUG_LINE.unsafe_write_string("\", }\n\r");
-
-                total_memory += entry.len;
-            }
-            assign_uninit! { PAGE_FRAME_ALLOCATOR (paging::frame_allocator::PageFrameAllocator) <= { paging::frame_allocator::PageFrameAllocator::from_response(memmap_response) }};
-        } else {
-            DEBUG_LINE.unsafe_write_line("No Entries in Memory Map!")
-        }
-    } else {
-        DEBUG_LINE.unsafe_write_line("Failed to get Memory Map!");
-    }
 
     log::set_logger(&kernel_logger::KERNEL_LOGGER).unwrap();
     log::set_max_level(log::LevelFilter::Debug);
@@ -360,7 +327,8 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
         .set_present(true)
         .set_privilege_level(x86_64::PrivilegeLevel::Ring0);
 
-    SYSTEM_IDT[0x20].set_handler_fn(handle_pit)
+    SYSTEM_IDT[0x20]
+        .set_handler_fn(handle_pit)
         .set_present(true);
 
     x86_64::set_general_handler!(&mut SYSTEM_IDT, __generic_error_irq_handler, 0..28);
@@ -374,21 +342,6 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
     legacy_pic::PRIMARY_PIC.sync();
 
     kprint!("Successfully loaded Interrupt Descriptor Table.");
-
-    if let Some(kernel_file) = KERNEL_FILE_REQUEST.get_response().get() {
-        if let Some(file) = kernel_file.kernel_file.get() {
-            assign_uninit! {
-                KERNEL_CMDLINE (&'static str) <= core::mem::transmute(file.cmdline.to_str().expect("Failed to get kernel cmdline.").to_str().unwrap())
-            }
-
-            assign_uninit! {
-                KERNEL_PATH (&'static str) <= core::mem::transmute(file.path.to_str().expect("Failed to get kernel path.").to_str().unwrap())
-            }
-        }
-
-        kprint!("KERNEL PARAMETERS: ", KERNEL_CMDLINE.assume_init());
-        kprint!("KERNEL PATH: ", KERNEL_PATH.assume_init(), endl!());
-    }
 
     if let Some(module_response) = MODULE_REQUEST.get_response().get() {
         kprint!(
@@ -458,14 +411,19 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
                         Ok(v) => v,
                     };
 
-                    (&mut *PAGE_MAPPER.as_mut_ptr()).update_flags(
-                        HugePage::from_start_address(VirtAddr::new(program_base.addr().transmute()).align_down(HugePage::SIZE)).unwrap(), 
-                        PageTableFlags::PRESENT | !PageTableFlags::NO_EXECUTE
+                    KERNEL_PAGE_MAPPER.lock().update_flags(
+                        HugePage::from_start_address(
+                            VirtAddr::new(program_base.addr().transmute())
+                                .align_down(HugePage::SIZE),
+                        )
+                        .unwrap(),
+                        PageTableFlags::PRESENT | !PageTableFlags::NO_EXECUTE,
                     );
 
                     // kdebug!("Program ELF: {:#?}", &bytes);
 
-                    let start: *const unsafe extern "C" fn(KernelProgramMeta) = core::mem::transmute(program_base.addr() as u64 + bytes.ehdr.e_entry);
+                    let start: *const unsafe extern "C" fn(KernelProgramMeta) =
+                        core::mem::transmute(program_base.addr() as u64 + bytes.ehdr.e_entry);
                 }
             }
 
@@ -475,12 +433,11 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
 
     //  kprint!(alloc_impl::format!("{:#?}", pf_allocator!().request_memory_area(((16 * consts::PAGE_SIZE) + 1200) as usize)).as_str());
 
-
     //let mut mapper = x86_64::structures::paging::RecursivePageTable::new(pml4_table)
     //    .expect("Failed to create Recursive Page Table Mapper.");
 
     asm!(
-        "mov r8w, 0x4", 
+        "mov r8w, 0x4",
         "mov r9w, 0x6",
         options(raw, preserves_flags)
     );
@@ -514,6 +471,7 @@ macro_rules! halt_while {
     };
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn rust_panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe {
