@@ -1,4 +1,6 @@
-use crate::{device::{Device, GeneralDevice, character::UnsafeCharacterDevice}, common::endl};
+use alloc::format;
+
+use crate::{device::{Device, GeneralDevice, character::UnsafeCharacterDevice}, common::endl, renderer::{self, Color, Renderer}};
 
 #[derive(Debug, Default)]
 pub struct Console{
@@ -18,8 +20,9 @@ impl UnsafeCharacterDevice for Console{
     }
 
     unsafe fn write_raw(&self, data: u8) {
-        super::renderer::Renderer::global().unsafe_draw_char( 10 + self.cursor_pos.0 * 16, 10 + self.cursor_pos.1 * (16 + self.line_padding), data)
+        let _ = super::renderer::Renderer::global().unsafe_draw_char( self.cursor_pos.0 * 16, self.cursor_pos.1 * (16 + self.line_padding), data);
     }
+
 
     unsafe fn received(&self) -> bool {
         false
@@ -48,30 +51,51 @@ impl UnsafeCharacterDevice for Console{
 
 pub(crate) static mut KERNEL_CONSOLE: Console = Console::new();
 
+pub const COLORS: [Color; 8] = [0x00000000, 0xFFFFFFFF, 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFF00, 0xFFFF00FF, 0xFF00FFFF];
 impl Console
 where
     Self: UnsafeCharacterDevice
 {
     pub fn write_str(&mut self, _str: &'_ str) {
-        for chr in _str.chars() {
+      
+
+        for (idx, chr) in _str.chars().enumerate() {
+            if self.cursor_pos.0 > super::Renderer::global().dimensions().0 / 8{
+                self.newline()
+            }
+            if self.cursor_pos.1 > super::Renderer::global().dimensions().1{
+                self.scroll();
+            }
+           
             if chr == '\n'{
                 self.newline();
                 continue;
             }
             unsafe { self.write_raw(chr as u8) }
             self.cursor_pos.0 += 1;
+        
         }
 
     }
 
+    pub fn get_line_padding(&mut self) -> usize{
+        16 + self.line_padding
+    }
+
     pub fn print(&mut self, _str: &'_ str) {
         self.write_str(_str);
-        self.write_str(endl!());
+        self.newline();
     }
 
     pub fn newline(&mut self){
         self.cursor_pos.1 += 1;
         self.cursor_pos.0 = 0;
+    }
+
+    pub fn scroll(&mut self){
+        unsafe { Renderer::global_mut().scroll(8, 2)};
+
+        self.cursor_pos.1 -= 1;
     }
 
     pub const fn new() -> Self{

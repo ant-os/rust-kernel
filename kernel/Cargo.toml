@@ -13,3 +13,14 @@ bitflags = "*"
 bitfield = "0.14.0"
 bit = "*"
 psf-rs = "2.1.4"
+ttf-parser = { version = "0.20.0", default-features = false }
+heapless = "*"
+git-version = "*"
+lock_api = "0.4.11"
+log = "0.4.20"
+elf = { version = "0.7.4", default-features = false, features = ["nightly"] }
+
+# I really want to not do this.... but here we go...
+x86_64 = "0.14.11"
+
+spin = "*"

@@ -1,12 +1,70 @@
 pub mod consts;
 pub mod io;
 pub mod macros;
+use core::{simd::ptr::SimdConstPtr, ptr::NonNull, mem::{size_of_val, size_of}, sync::atomic::AtomicPtr, ops::Deref};
+
 pub use limine::*;
 pub mod idt;
 pub mod gdt;
-
+pub mod handler;
 
 pub type Unit = ();
+
+#[doc = "A [AtomicPtr] wrapper that implements [Deref]."]
+#[repr(transparent)]
+struct AtomicRef<T: Sized>{
+    inner: AtomicPtr<T>
+}
+
+unsafe impl<T: Sized> Sync for AtomicRef<T> {} /// It's just an [AtomicPtr] internally so it's "thread-safe".
+
+impl<T: Sized> AtomicRef<T> {
+    #[doc = "Create a new [AtomicRef]."]
+    fn new(inner: *mut T) -> Self { Self { inner: AtomicPtr::new(inner) } }
+}
+
+impl<T: Sized> Deref for AtomicRef<T> {
+    type Target = T;
+
+    #[doc = "Loads(Relaxed) and then Dereferences the pointer stored by the inner [AtomicRef]. **Panics** when the inner pointer is null."]
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.inner.load(core::sync::atomic::Ordering::Relaxed)
+            .as_ref()
+            .expect("AtomicPtr was null.") }
+    }
+}
+
+#[doc = "Utility Trait"]
+pub(crate) unsafe trait TransmuteIntoPointer{
+    /// Calls [core::intrinsics::transmute_unchecked<Self, *mut T>].
+    #[inline(always)]
+    unsafe fn ptr<T: Sized>(self) -> *mut T where Self: Sized{
+        core::intrinsics::transmute::<Self, *mut T>(self)
+    }
+}
+
+#[doc = "Utility Trait"]
+pub(crate) unsafe trait TransmuteInto<T: Sized>{
+    /// Calls [core::intrinsics::transmute_unchecked<Self, T>]
+    #[inline(always)]
+    unsafe fn transmute(self) -> T where Self: Sized{
+        core::intrinsics::transmute_unchecked::<Self, T>(self)
+    }
+}
+
+unsafe impl TransmuteIntoPointer for usize { /* empty */ }
+unsafe impl<T: Sized> TransmuteInto<NonNullPtr<T>> for NonNull<T>{ /* empty */ }
+
+unsafe impl<T: Sized> TransmuteInto<AtomicPtr<T>> for AtomicRef<T> { /* empty */ }
+
+#[cfg(target_pointer_width = "64")]
+unsafe impl TransmuteInto<u64> for usize{ /* empty */ }
+#[cfg(target_pointer_width = "32")]
+unsafe impl TransmuteInto<u32> for usize{ /* empty */ }
+
+unsafe impl<T: ?Sized> TransmuteInto<usize> for &'_ mut T { /* empty */ }
+unsafe impl<T: ?Sized> TransmuteInto<usize> for *mut T { /* empty */ }
+unsafe impl<T: ?Sized> TransmuteInto<usize> for *const T { /* empty */ }
 
 #[macro_export]
 macro_rules! __asm{
@@ -38,7 +96,7 @@ pub struct DescriptorTablePointer {
 #[inline]
 pub unsafe fn lidt(ptr: &DescriptorTablePointer) {
     unsafe {
-        core::arch::asm!("lidt [{}]", in(reg) ptr, options(readonly, nostack, preserves_flags));
+        core::arch::asm!("lidt [{0}]", in(reg) ptr, options(nostack, preserves_flags));
     }
 }
 
@@ -61,12 +119,14 @@ macro_rules! debug{
     ($($msg:expr),*) => {
         unsafe{
         $(
-            crate::DEBUG_LINE.unsafe_write_string($msg);
-        );
+            $crate::DEBUG_LINE.unsafe_write_string($msg);
+        )
         *
     }
     }
 }
+
+
 
 #[macro_export]
 macro_rules! kprint{
@@ -81,6 +141,7 @@ macro_rules! kprint{
     }
     }
 }
+
 
 #[macro_export]
 macro_rules! debug_err{
@@ -125,6 +186,21 @@ macro_rules! make_wrapper {
             }
         }
     }
+}
+
+
+pub(crate) macro __kdebug_newline() {
+    debug!("\n")
+}
+
+#[macro_export]
+macro_rules! kdebug {
+    () => {
+        crate::__kdebug_newline!()
+    };
+    ($($arg:tt)*) => {
+        $crate::DEBUG_LINE.unsafe_write_string($crate::alloc_impl::format!($($arg)*).as_str())
+    };
 }
 
 #[allow(missing_fragment_specifier)]

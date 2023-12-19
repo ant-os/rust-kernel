@@ -12,6 +12,7 @@ pub unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+#[inline(always)]
 pub unsafe fn io_wait() {
-    unimplemented!();
+   // outb(0x0, 0x80);
 }

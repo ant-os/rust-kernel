@@ -1,9 +1,13 @@
+use core::ptr::NonNull;
+
 use crate::{
     consts::{INVALID_PAGE_STATE, PAGE_SIZE},
-    debug, endl, extra_features,
+    debug, endl, extra_features, memory::{MemoryArea, PhysicalAddress},
 };
 
+use alloc::sync::Arc;
 use limine::{MemmapEntry, MemmapResponse, MemoryMapEntryType, NonNullPtr};
+use x86_64::{structures::paging::{Size4KiB, PhysFrame}, PhysAddr};
 
 pub type PageBitmap = bitmap::Bitmap<PtrWrapper<[usize]>, bitmap::OneBit>;
 
@@ -162,8 +166,19 @@ impl PageFrameAllocator {
 
         self.lock_pages(
             bitmap_segment.base as usize,
-            bitmap_segment.len as usize / (PAGE_SIZE + 1) as usize,
+            (bitmap_segment.len / PAGE_SIZE) as usize + 1 as usize,
         );
+
+        self.lock_pages(
+            crate::KERNEL_BASE.physical_base as usize,
+            (crate::KERNEL_FILE.length / PAGE_SIZE + 1) as usize,
+        );
+
+        for fb in crate::FRAMEBUFFERS.iter(){
+            if let Some(ptr) = fb.address.as_ptr(){
+                self.lock_pages(ptr.addr(), (fb.height * fb.width / PAGE_SIZE) as usize + 1);
+            }
+        }
 
         self._initialized = true;
 
@@ -306,6 +321,41 @@ impl PageFrameAllocator {
         Err(Error::OutOfMemory)
     }
 
+    #[must_use]
+    pub fn request_memory_area(&mut self, size: usize) -> Result<MemoryArea, Error>{
+        let mut pages_left = (size / crate::consts::PAGE_SIZE as usize) + 1;
+        let mut base: usize = 0;
+
+        extra_features! {
+            for (_, self._bitmap_index < self.bitmap.len() * 8 && pages_left > 0, self._bitmap_index += 1){
+
+                let state = self.bitmap.get(self._bitmap_index).unwrap_or(INVALID_PAGE_STATE);
+
+                match state{
+                    1 => {
+                        pages_left = size / crate::consts::PAGE_SIZE as usize;
+                        base = 0;
+                    },
+                    0 => {
+                        self.mark_page_as::<{ PageState::Used }>(self._bitmap_index)?;
+
+                        if base == 0{
+                            base = self._bitmap_index * PAGE_SIZE as usize;
+                        }
+                        pages_left -= 1;
+                    },
+                    _ => return Err(Error::OutOfBitmapBounds)
+                };
+            }
+        }
+
+        if base != 0{
+            Ok(MemoryArea::new(PhysicalAddress::new(base).to_virtual().data(), size))
+        }else{
+            Err(Error::OutOfMemory)
+        }
+    }
+
     fn reserve_page(&mut self, addr: usize) -> Result<(), Error> {
         let index: usize = (addr / crate::consts::PAGE_SIZE as usize);
         let state = self.bitmap.get(addr).unwrap_or(INVALID_PAGE_STATE);
@@ -373,5 +423,13 @@ impl bitmap::Storage for PtrWrapper<[usize]> {
 
     fn as_mut(&mut self) -> &mut [usize] {
         unsafe { &mut *self.0 }
+    }
+}
+
+unsafe impl x86_64::structures::paging::FrameAllocator<Size4KiB> for PageFrameAllocator{
+    fn allocate_frame(&mut self) -> Option<x86_64::structures::paging::PhysFrame<Size4KiB>> {
+        let page_base_addr = self.request_page().ok()?;
+
+        PhysFrame::from_start_address(PhysAddr::new(page_base_addr as u64)).ok()
     }
 }

@@ -9,39 +9,70 @@
 #![feature(inherent_associated_types)]
 #![feature(adt_const_params)]
 #![feature(abi_x86_interrupt)]
+#![feature(allocator_api)]
+#![feature(const_mut_refs)]
+#![feature(portable_simd)]
 #![feature(strict_provenance)]
-#![recursion_limit = "2000"]
+#![feature(sync_unsafe_cell)]
+#![feature(debug_closure_helpers)]
+#![feature(marker_trait_attr)]
+#![feature(asm_const)]
+#![feature(type_name_of_val, rustc_private)]
+#![feature(const_trait_impl)]
+#![recursion_limit = "225"]
 
+extern crate alloc;
+
+pub mod alloc_impl;
 pub mod bitmap_font;
 pub mod common;
 pub mod device;
 pub mod framebuffer;
+pub mod kernel_logger;
+pub mod legacy_pic;
+pub mod memory;
 pub mod paging;
 pub mod renderer;
 pub mod serial;
 pub mod status;
-pub mod memory;
 pub mod tty;
+pub mod graphics;
+use alloc::format;
+use alloc_impl as _;
+use x86_64::structures::idt::InterruptStackFrame;
+use x86_64::structures::paging::page::PageRange;
+use x86_64::structures::paging::{Mapper, PhysFrame, Size4KiB, Size2MiB, PageTableFlags};
+use x86_64::{structures, PhysAddr, VirtAddr};
 
-pub(crate) use tty::KERNEL_CONSOLE;
+use crate::alloc_impl::KERNEL_ALLOCATOR;
+use crate::common::idt::{Idt, KERNEL_IDT};
+use crate::common::io::outb;
 use crate::common::*;
 use crate::device::{
     character::{TimedCharacterDevice, *},
     Device, GeneralDevice,
 };
-use crate::memory::{VirtualAddress, PhysicalAddress};
+use crate::memory::{
+    active_level_4_table, PhysicalAddress, VirtualAddress, PHYSICAL_BOOTLOADER_MEMORY_OFFSET,
+    PHYSICAL_MEMORY_OFFSET,
+};
 use crate::paging::table_manager::PageTableManager;
 use core::arch::asm;
 use core::ffi::CStr;
+use elf::endian::AnyEndian;
+use elf::segment::ProgramHeader;
+use memory::MemoryArea;
+pub(crate) use tty::KERNEL_CONSOLE;
 #[macro_use]
 use core::intrinsics::{likely, unlikely};
 #[macro_use]
 use core::fmt::*;
+use crate::paging::{pf_allocator, pt_manager, PageTable};
 use core::mem;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use crate::paging::{pf_allocator, PageTable, pt_manager};
-#[macro_use] extern crate bitfield;
+#[macro_use]
+extern crate bitfield;
 use numtoa::NumToA;
 use renderer::Renderer;
 
@@ -51,6 +82,9 @@ static MEMMAP_REQUEST: limine::MemmapRequest = limine::MemmapRequest::new(0);
 static KERNEL_ADDRESS_REQUEST: limine::KernelAddressRequest = limine::KernelAddressRequest::new(0);
 static KERNEL_FILE_REQUEST: limine::KernelFileRequest = limine::KernelFileRequest::new(0);
 static MODULE_REQUEST: limine::ModuleRequest = limine::ModuleRequest::new(0);
+
+static mut SYSTEM_IDT: structures::idt::InterruptDescriptorTable =
+    structures::idt::InterruptDescriptorTable::new();
 
 pub(crate) static mut GENERIC_STATIC_BUFFER: [u8; 25] = [0u8; 25];
 
@@ -63,20 +97,110 @@ decl_uninit! {
     ITOA_BUFFER => itoa::Buffer,
     KERNEL_CMDLINE => &'static str,
     KERNEL_PATH => &'static str,
-    PAGE_TABLE_MANAGER => crate::paging::table_manager::PageTableManager
+    PAGE_TABLE_MANAGER => crate::paging::table_manager::PageTableManager,
+    PAGE_MAPPER => x86_64::structures::paging::OffsetPageTable
 }
 
-lazy_static::lazy_static!{
+lazy_static::lazy_static! {
     pub(crate) static ref FRAMEBUFFERS: &'static [NonNullPtr<limine::Framebuffer>] = {
         if let Some(fb_resp) = FRAMEBUFFERS_REQUEST.get_response().get(){
-            fb_resp.framebuffers::<'static>()
+            unsafe { core::mem::transmute(fb_resp.framebuffers()) }
         }else{
             debug_err!("Failed to get the list of System Framebuffers!");
             panic!("Failed to get the list of System Framebuffers!");
         }
     };
+    pub(crate) static ref KERNEL_BASE: &'static limine::KernelAddressResponse = {
+        if let Some(resp) = KERNEL_ADDRESS_REQUEST.get_response().get::<'static>(){
+            resp
+        }else{
+            debug_err!("Failed to get the list of System Framebuffers!");
+            log::error!("Failed to get the list of System Framebuffers!");
+            panic!("Failed to get the list of System Framebuffers!");
+        }
+    };
+    pub(crate) static ref KERNEL_FILE: &'static limine::File = {
+        if let Some(resp) = KERNEL_FILE_REQUEST.get_response().get(){
+            resp.kernel_file.get::<'static>().unwrap()
+        }else{
+            debug_err!("Failed to get the list of System Framebuffers!");
+            log::error!("Failed to get the list of System Framebuffers!");
+            panic!("Failed to get the list of System Framebuffers!");
+        }
+    };
+    #[doc = "The Area of Memory the Kernel Uses."]
+    static ref KERNEL_AREA: MemoryArea = MemoryArea::new(KERNEL_BASE.virtual_base as usize, KERNEL_FILE.length as usize);
+    static ref L4_PAGE_TABLE: &'static mut PageTable = unsafe { active_level_4_table(VirtAddr::zero()) };
+}
 
-   
+
+#[derive(Debug, Clone, Copy)]
+enum OutlineSegment {
+    MoveTo(f32, f32),
+    LineTo(f32, f32),
+    QuadTo(f32, f32, f32, f32),
+    CurveTo(f32, f32, f32, f32, f32, f32),
+    Stop,
+}
+
+type HugePage = x86_64::structures::paging::Page<Size2MiB>;
+
+#[no_mangle]
+unsafe extern "C" fn __prog_debug_print(__base: *const u8, __len: usize) {
+    KERNEL_CONSOLE.write_str(core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+        __base, __len,
+    )));
+}
+
+type DbgPrintFn = unsafe extern "C" fn(*const u8, usize);
+
+extern "x86-interrupt" fn handle_pit(_frame: InterruptStackFrame){
+   unsafe { kdebug!("Tick Tock") }
+} 
+
+#[repr(C)]
+pub struct KernelProgramMeta {
+    _dbg_print: *const DbgPrintFn,
+}
+
+const MAX_FONT_OUTLINE_SEGMENTS: usize = 25;
+
+pub struct FontOutline(heapless::Vec<OutlineSegment, MAX_FONT_OUTLINE_SEGMENTS>);
+
+impl FontOutline {
+    pub const fn new() -> Self {
+        Self(heapless::Vec::<OutlineSegment, MAX_FONT_OUTLINE_SEGMENTS>::new())
+    }
+
+    pub const fn segments(&self) -> &'_ heapless::Vec<OutlineSegment, MAX_FONT_OUTLINE_SEGMENTS> {
+        &(self.0)
+    }
+
+    pub fn push(&mut self, seg: OutlineSegment) {
+        self.0.push(seg).expect("Failed to push Font Segment");
+    }
+}
+
+impl ttf_parser::OutlineBuilder for FontOutline {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.push(OutlineSegment::MoveTo(x, y))
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.push(OutlineSegment::LineTo(x, y))
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        self.push(OutlineSegment::QuadTo(x1, y1, x, y))
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        self.push(OutlineSegment::CurveTo(x1, y1, x2, y2, x, y))
+    }
+
+    fn close(&mut self) {
+        self.push(OutlineSegment::Stop)
+    }
 }
 
 pub const FONT_BITMAP: bitmap_font::BitmapFont = include!("bitmap.raw");
@@ -96,27 +220,84 @@ struct Person {
     name: &'static str,
 }
 
-pub unsafe extern "C" fn irq0_timer() {
-    unsafe { DEBUG_LINE.unsafe_write_line("Tick!") }
+pub type InterruptParams = (usize, *mut ());
+
+#[no_mangle]
+pub extern "x86-interrupt" fn __irq_handler(_frame: InterruptStackFrame) {
+    let (mut r8, mut r9, mut r10): (u64, u64, u64);
+}
+
+static mut has_panicked: bool = false;
+
+fn __generic_error_irq_handler(
+    stack_frame: InterruptStackFrame,
+    index: u8,
+    error_code: Option<u64>,
+) {
+    unsafe {
+        // Renderer::global_mut().clear(0xFF0000FF);
+        Renderer::global_mut().update_colors(Some(0xFF0000FF), Some(0xFF0000FF));
+        KERNEL_CONSOLE.cursor_pos = (1, 1);
+        KERNEL_CONSOLE.print("=== PANIC ===");
+        log::error!(
+            "A Exception has happend: ( error = {:?}, index = {:?}, frame = {:#?}",
+            error_code,
+            index,
+            stack_frame
+        );
+        kdebug!(
+            "A Exception has happend: ( error = {:?}, index = {:?}, frame = {:#?}",
+            error_code,
+            index,
+            stack_frame
+        );
+
+        hcf();
+    };
 }
 
 #[no_mangle]
-unsafe extern "C" fn _start<'_kernel>() -> ! {
-    DEBUG_LINE.wait_for_connection();
-
+unsafe extern "C" fn _start<'kernel>() -> ! {
     // let formated = buffer.format(123);
 
-    let mut kernel_renderer = renderer::Renderer::new(FRAMEBUFFERS.get(0).expect("No System Framebuffers."), &FONT_BITMAP);
+    let PRIMARY_FONT: Option<limine::File> = None;
 
-    kernel_renderer.update_colors(Some(0xFFFFFFFF), Some(0xFF010FFF));
-    kernel_renderer.clear(0xFF010FFF);
+    let mut kernel_renderer = renderer::Renderer::new(
+        FRAMEBUFFERS.get(0).expect("No System Framebuffers."),
+        &FONT_BITMAP,
+    );
+
+    let color = graphics::Color::from_rgb(0, 255, 0);
+
+    kernel_renderer.update_colors(Some(0xFFFFFFFF), Some(color.inner()));
+    kernel_renderer.clear(color.inner()); // 0xFF010FFF
     kernel_renderer.optional_font_scaling = Some(2);
 
     Renderer::make_global(kernel_renderer);
 
+    kprint!(
+        "(c) 2023 Joscha Egloff & AntOS Project. See README.MD for more info.\n",
+        "AntOS Kernel ( ",
+        git_version::git_version!(),
+        " )"
+    );
+
     KERNEL_CONSOLE.newline();
 
-    kprint!("Hello World!\n");
+    use graphics::{Color, RGBA}; 
+
+    let my_color: Color = Color::from_rgb(255, 255, 255);
+    let my_rgba_color: RGBA = *my_color;
+
+    kprint!("Console Successfully Initialized.\n");
+
+    use x86_64::structures::paging::OffsetPageTable;
+
+    assign_uninit!{
+        PAGE_MAPPER (OffsetPageTable) <=  { x86_64::structures::paging::mapper::OffsetPageTable::new(active_level_4_table(VirtAddr::zero()), VirtAddr::zero()) }
+    }
+
+    DEBUG_LINE.wait_for_connection();
 
     let mut total_memory = 0;
 
@@ -154,26 +335,17 @@ unsafe extern "C" fn _start<'_kernel>() -> ! {
         DEBUG_LINE.unsafe_write_line("Failed to get Memory Map!");
     }
 
-    common::lgdt(&DescriptorTablePointer {
-        limit: (gdt::INIT_GDT.len() * core::mem::size_of::<gdt::GdtEntry>() - 1) as u16,
-        base: gdt::INIT_GDT.as_ptr() as u64,
-    });
+    log::set_logger(&kernel_logger::KERNEL_LOGGER).unwrap();
+    log::set_max_level(log::LevelFilter::Debug);
 
-    let mut pml4_addr = 0usize;
+    alloc_impl::KERNEL_ALLOCATOR
+        .initialize()
+        .expect("Failed to initialized Global Allocator.");
 
-    asm!("mov cr0, {0}", out(reg) pml4_addr);
-
-    let pml4 = NonNull::<PageTable>::dangling().with_addr(NonZeroUsize::new(pml4_addr).unwrap());
-    
-    let ptm = PageTableManager::from_pml4(core::mem::transmute(pml4))
-        .expect("Failed to crate Page Table Manager");
-
-    //  ptm.register();
-
-    ptm.make_global();
+    // kprint!(alloc_impl::format!("Remaining Allocator Arena: {}", alloc_impl::KERNEL_ALLOCATOR.get_arena_size()).as_str());
 
     if let Some(kernel_addr) = KERNEL_ADDRESS_REQUEST.get_response().get() {
-        debug!(
+        kprint!(
             "KERNEL BASE: ( virtual: 0x",
             VirtualAddress::new(kernel_addr.virtual_base as usize).as_str(),
             ", physical: 0x",
@@ -181,20 +353,27 @@ unsafe extern "C" fn _start<'_kernel>() -> ! {
             " )",
             endl!()
         );
-
-        match pt_manager!()
-            .map_memory(VirtualAddress::new(kernel_addr.virtual_base as usize),
-                 PhysicalAddress::new(kernel_addr.physical_base as usize)
-            )
-        {
-            Ok(_) => {},
-            Err(paging::table_manager::MemoryMapError::FrameAllocator(e)) => debug_err!("Frame Allocator Error", endl!()),
-            Err(paging::table_manager::MemoryMapError::TableNotFound) => debug_err!("One or more tables weren't found for virtual address 0x", VirtualAddress::new(kernel_addr.virtual_base as usize).as_str(), "!", endl!()),
-            Err(_) => debug_err!("Other Error", endl!())
-        };
     }
 
+    SYSTEM_IDT[0x80 as usize]
+        .set_handler_fn(__irq_handler)
+        .set_present(true)
+        .set_privilege_level(x86_64::PrivilegeLevel::Ring0);
 
+    SYSTEM_IDT[0x20].set_handler_fn(handle_pit)
+        .set_present(true);
+
+    x86_64::set_general_handler!(&mut SYSTEM_IDT, __generic_error_irq_handler, 0..28);
+
+    SYSTEM_IDT.load();
+
+    // outb(0xF0, io::inb(0xF0) | 0x100);
+
+    legacy_pic::PRIMARY_PIC.enable(legacy_pic::Interrupt::PIT);
+
+    legacy_pic::PRIMARY_PIC.sync();
+
+    kprint!("Successfully loaded Interrupt Descriptor Table.");
 
     if let Some(kernel_file) = KERNEL_FILE_REQUEST.get_response().get() {
         if let Some(file) = kernel_file.kernel_file.get() {
@@ -207,59 +386,123 @@ unsafe extern "C" fn _start<'_kernel>() -> ! {
             }
         }
 
-        debug!("CMDLINE: ", KERNEL_CMDLINE.assume_init(), endl!());
-        debug!("PATH: ", KERNEL_PATH.assume_init(), endl!());
+        kprint!("KERNEL PARAMETERS: ", KERNEL_CMDLINE.assume_init());
+        kprint!("KERNEL PATH: ", KERNEL_PATH.assume_init(), endl!());
     }
 
     if let Some(module_response) = MODULE_REQUEST.get_response().get() {
-        debug!(
+        kprint!(
             "MODULE COUNT: ",
             integer_to_string(module_response.module_count),
             endl!()
         );
         for module in module_response.modules() {
-            kprint!(
-                "Found Module ",
-                module
-                    .path
-                    .to_str()
-                    .expect("Failed to get Module Path")
-                    .to_str()
-                    .unwrap(),
-                "!"
-            );
+            let path = module
+                .path
+                .to_str()
+                .expect("Failed to get Module Path")
+                .to_str()
+                .unwrap();
 
-            let addr =  module.base.as_ptr().unwrap() as usize;
+            let cmdline = module
+                .cmdline
+                .to_str()
+                .expect("Failed to get Module Path")
+                .to_str()
+                .unwrap();
 
-
-            pt_manager!().map_memory_internal(VirtualAddress::new(addr), PhysicalAddress::new(addr));
-
-            match pt_manager!().get_page_entry(VirtualAddress::new(addr)){
-                Ok(_) => {},
-                Err(paging::table_manager::MemoryMapError::FrameAllocator(e)) => debug_err!("Frame Allocator Error", endl!()),
-                Err(paging::table_manager::MemoryMapError::TableNotFound) => debug_err!("One or more tables weren't found for virtual address 0x", VirtualAddress::new(addr).as_str(), "!", endl!()),
-                Err(_) => debug_err!("Other Error", endl!())
-            };
-
-            KERNEL_CONSOLE.line_padding = 4;
+            let addr = module.base.as_ptr().unwrap() as usize;
 
             kprint!(
-                "Module Base: 0x",
-                VirtualAddress::new(addr).as_str()
+                "$BOOT$",
+                path,
+                ": Successfully loaded... {\n parameters = [ ",
+                cmdline,
+                " ],\n base = 0x",
+                VirtualAddress::new(addr).as_str(),
+                "\n}"
             );
+
+            'module: {
+                if path.contains(".TTF") {
+                    let face_result = ttf_parser::Face::parse(
+                        core::slice::from_raw_parts(
+                            module.base.as_ptr().unwrap(),
+                            module.length as usize,
+                        ),
+                        0,
+                    );
+
+                    if let Ok(face) = face_result {
+                        let id = face.glyph_index('A').unwrap();
+
+                        let mut builder = FontOutline::new();
+
+                        face.outline_glyph(id, &mut builder).unwrap();
+
+                        kprint!(
+                            "Font has ",
+                            integer_to_string(builder.segments().len()),
+                            " Segments!"
+                        );
+                    }
+                } else if path.contains(".SYS") {
+                    let program_base = module.base.as_ptr().expect("No Module Base");
+                    let program = core::slice::from_raw_parts(program_base, module.length as usize);
+
+                    let bytes = match elf::ElfBytes::<AnyEndian>::minimal_parse(program) {
+                        Err(e) => {
+                            log::error!("Error Parsing Program: {:#?}", e);
+                            break 'module;
+                        }
+                        Ok(v) => v,
+                    };
+
+                    (&mut *PAGE_MAPPER.as_mut_ptr()).update_flags(
+                        HugePage::from_start_address(VirtAddr::new(program_base.addr().transmute()).align_down(HugePage::SIZE)).unwrap(), 
+                        PageTableFlags::PRESENT | !PageTableFlags::NO_EXECUTE
+                    );
+
+                    // kdebug!("Program ELF: {:#?}", &bytes);
+
+                    let start: *const unsafe extern "C" fn(KernelProgramMeta) = core::mem::transmute(program_base.addr() as u64 + bytes.ehdr.e_entry);
+                }
+            }
+
+            //  pt_manager!().map_memory_internal(VirtualAddress::new(addr), PhysicalAddress::new(addr));
         }
     }
 
+    //  kprint!(alloc_impl::format!("{:#?}", pf_allocator!().request_memory_area(((16 * consts::PAGE_SIZE) + 1200) as usize)).as_str());
+
+
+    //let mut mapper = x86_64::structures::paging::RecursivePageTable::new(pml4_table)
+    //    .expect("Failed to create Recursive Page Table Mapper.");
+
+    asm!(
+        "mov r8w, 0x4", 
+        "mov r9w, 0x6",
+        options(raw, preserves_flags)
+    );
+    x86_64::software_interrupt!(0x80);
+    let mut result: u16;
+    asm!("nop", out("r10w") result);
+
+    log::info!("Hello from the AntOS Kernel! ;)");
+
+    // log::debug!("MemArea: {:#?}", pf_allocator!().request_memory_area(2000));
+
     DEBUG_LINE.unsafe_write_line("End of Runtime.");
 
-
-    hcf();
+    loop {
+        asm!("hlt");
+    }
 }
 
-pub fn boolean_to_str(value: bool) -> &'static str{
-    match value{
+pub fn boolean_to_str(value: bool) -> &'static str {
+    match value {
         true => "true",
-        false => "false"
+        false => "false",
     }
 }
 
@@ -281,6 +524,8 @@ fn rust_panic(_info: &core::panic::PanicInfo) -> ! {
                 .unwrap_or(&"Panic!" as &&'_ str),
         );
     }
+
+    log::error!("A Rust Panic has occurred: \n{:#?}\n", _info);
 
     hcf();
 }

@@ -1,5 +1,7 @@
 //! Global Descriptor Table
 
+use super::{AtomicRef, DescriptorTablePointer};
+
 pub const GDT_NULL: usize = 0;
 pub const GDT_KERNEL_CODE: usize = 1;
 pub const GDT_KERNEL_DATA: usize = 2;
@@ -26,16 +28,6 @@ pub const GDT_A_TSS_BUSY: u8 = 0xB;
 pub const GDT_F_PAGE_SIZE: u8 = 1 << 7;
 pub const GDT_F_PROTECTED_MODE: u8 = 1 << 6;
 pub const GDT_F_LONG_MODE: u8 = 1 << 5;
-
-pub(crate) static mut INIT_GDT: [GdtEntry; 3] = [
-    // Null
-    GdtEntry::new(0, 0, 0, 0),
-    // Kernel code
-    GdtEntry::new(0, 0, GDT_A_PRESENT | GDT_A_RING_0 | GDT_A_SYSTEM | GDT_A_EXECUTABLE | GDT_A_PRIVILEGE, GDT_F_LONG_MODE),
-    // Kernel data
-    GdtEntry::new(0, 0, GDT_A_PRESENT | GDT_A_RING_0 | GDT_A_SYSTEM | GDT_A_PRIVILEGE, GDT_F_LONG_MODE),
-];
-
 
 
 #[derive(Copy, Clone, Debug)]
@@ -72,3 +64,8 @@ impl GdtEntry {
         self.flags_limith = self.flags_limith & 0xF0 | ((limit >> 16) as u8) & 0x0F;
     }
 }
+
+
+
+
+

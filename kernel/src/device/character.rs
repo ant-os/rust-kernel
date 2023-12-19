@@ -3,6 +3,8 @@ pub enum CharacterDeviceMode {
     Loopback,
 }
 
+
+
 pub trait UnsafeCharacterDevice
 where
     Self: super::GeneralDevice,

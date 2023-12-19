@@ -1,13 +1,16 @@
 //! Interrupt Descriptor Table
 
-use core::arch::asm;
+use core::{arch::asm, alloc::Layout, sync::atomic::AtomicPtr};
 use bitflags::bitflags;
 
-const GDT_KERNEL_CODE: u16 = 1;
+use crate::{alloc_impl::KERNEL_ALLOCATOR, PAGE_TABLE_MANAGER, paging::pt_manager, memory::{VirtualAddress, PhysicalAddress}};
+
+const GDT_KERNEL_CODE: u16 = 0x8;
 
 pub type IdtEntries = [IdtEntry; 256];
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct Idt {
     pub entries: IdtEntries
 }
@@ -31,8 +34,6 @@ impl Idt {
         }
     }
 }
-
-
 
 bitflags! {
     pub struct IdtFlags: u8 {
@@ -92,6 +93,18 @@ impl IdtEntry {
     // A function to set the offset more easily
     pub fn set_func(&mut self, func: unsafe extern fn()) {
         self.set_flags(IdtFlags::PRESENT | IdtFlags::RING_0 | IdtFlags::INTERRUPT);
-        self.set_offset((GDT_KERNEL_CODE as u16) << 3, func as usize);
+        self.set_offset(0x8, func as usize);
     }
+}
+
+lazy_static::lazy_static!{
+    pub static ref KERNEL_IDT: AtomicPtr<Idt> = unsafe {
+        KERNEL_ALLOCATOR.assume_init();
+        
+        let idt = alloc::boxed::Box::<Idt>::into_raw(alloc::boxed::Box::<Idt>::new(Idt::new()));
+
+       //  pt_manager!().map_memory(VirtualAddress::new(idt.addr()), PhysicalAddress::new(idt.addr()));
+
+        AtomicPtr::new(idt)
+    };
 }

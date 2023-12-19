@@ -9,7 +9,9 @@ pub mod frame_allocator;
 pub mod table_manager;
 pub mod indexer;
 
-
+#[deprecated = "This is not thread-safe at all, a better method is work in process."]
+/// UNSAFETY: Get a mutable reference to a static that might not be initialized(**`MaybeUnit`**).
+/// Don't use if you don't know exactly what your doing, even if you do, using this will probably lead to **UB**.
 pub macro pf_allocator() {
     (unsafe { &mut *crate::PAGE_FRAME_ALLOCATOR.as_mut_ptr() })
 }
@@ -80,44 +82,7 @@ impl Drop for SafePagePtr {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct PageTableEntry(usize);
+pub use x86_64::structures::paging::page_table::PageTableEntry;
+pub use x86_64::structures::paging::page_table::PageTable;
 
-impl PageTableEntry{
-    pub fn present(&self) -> bool{
-        self.0.bit(1)
-    }
-
-    pub fn set_present(&mut self, value: bool){
-        self.0.set_bit(0, value);
-    }
-
-    pub fn rw(&self) -> bool{
-        self.0.bit(1)
-    }
-
-    pub fn set_rw(&mut self, value: bool){
-        self.0.set_bit(1, value);
-    }
-
-    pub fn addr(&self) -> PhysicalAddress{
-        PhysicalAddress::new(self.0 & 0x0000_FFFF_FFFF_F000)
-    }
-
-    pub fn set_addr(&mut self, value: usize){
-        self.0 |= value
-    }
-
-    pub fn data(&self) -> usize{
-        self.0
-    }
-
-   
-}
-
-#[repr(align(0x1000))]
-pub struct PageTable{
-    pub entries: [PageTableEntry; 512]
-}
-
-
+pub struct PageFrameMapper;

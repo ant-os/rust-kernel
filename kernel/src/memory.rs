@@ -1,6 +1,7 @@
 //! Common Memory Structures, e.g [VirtualAddress].
 
 use numtoa::NumToA as _;
+use x86_64::{VirtAddr, structures::paging::PageTable};
 
 /// Specific table to be used, needed on some architectures
 //TODO: Use this throughout the code
@@ -12,6 +13,22 @@ pub enum TableKind {
     Kernel,
 }
 
+pub(crate) const PHYSICAL_MEMORY_OFFSET: usize = 0xffffffff80000000;
+pub(crate) const PHYSICAL_BOOTLOADER_MEMORY_OFFSET: u64 = 0x00;
+
+pub(crate) unsafe fn active_level_4_table(physical_memory_offset: VirtAddr)
+    -> &'static mut PageTable
+{
+    use x86_64::registers::control::Cr3;
+
+    let (level_4_table_frame, _) = Cr3::read();
+
+    let phys = level_4_table_frame.start_address();
+    let virt = VirtAddr::new_unsafe(phys.as_u64());
+    let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
+
+    &mut *page_table_ptr // unsafe
+}
 
 
 /// Physical memory address
@@ -37,6 +54,10 @@ impl PhysicalAddress {
 
     pub fn as_str<'a>(&self) -> &'a str{
         self.0.numtoa_str(16, unsafe { &mut crate::GENERIC_STATIC_BUFFER })
+    }
+
+    pub fn to_virtual(&self) ->  VirtualAddress{
+        VirtualAddress::new(PHYSICAL_MEMORY_OFFSET + (self.data() >> 12))
     }
 }
 
@@ -73,11 +94,28 @@ impl VirtualAddress {
     pub fn as_str<'a>(&self) -> &'a str{
         self.0.numtoa_str(16, unsafe { &mut crate::GENERIC_STATIC_BUFFER })
     }
+
+    pub unsafe fn as_ptr(&self) -> *mut u8{
+        core::mem::transmute::<_, *mut u8>(self.0)
+    } 
+}
+
+impl alloc::fmt::Debug for VirtualAddress{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("VirtualAddress").field_with(|v|v.write_fmt(format_args!("{:#x}",&self.0))).finish()
+    }
 }
 
 
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryArea {
-    pub base: PhysicalAddress,
+    pub base: VirtualAddress,
     pub size: usize,
 }
+
+impl MemoryArea{
+    pub const fn new(base: usize, size: usize) -> Self{
+        Self { base: VirtualAddress::new(base), size }
+    }
+}
+

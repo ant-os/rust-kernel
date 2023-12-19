@@ -5,6 +5,7 @@ use crate::device::{
     character::{CharacterDeviceMode, TimedCharacterDevice, UnsafeCharacterDevice},
     Device, GeneralDevice,
 };
+use crate::kprint;
 
 pub enum Port {
     COM1 = 0x3F8,
@@ -114,16 +115,17 @@ where
             while self.test() {}
 
             self.unsafe_write_string("(CONNECTED)\n\r");
+            kprint!("Successfully connected to serial line.")
         }
     }
 
-    pub unsafe fn unsafe_write_string(&self, _str: &'static str) {
+    pub unsafe fn unsafe_write_string(&self, _str: &'_ str) {
         for chr in _str.chars() {
             self.write(chr as u8);
         }
     }
 
-    pub unsafe fn unsafe_write_line(&self, _str: &'static str) {
+    pub unsafe fn unsafe_write_line(&self, _str: &'_ str) {
         self.unsafe_write_string(_str);
         self.unsafe_write_string("\n\r");
     }
