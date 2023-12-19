@@ -17,6 +17,6 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Build
-      run: cargo +nightly build --verbose --manifest-path=kernel/Cargo.toml 
+      run: cargo +nightly +x86_64-unknown-none build --verbose --manifest-path=kernel/Cargo.toml 
     - name: Run tests
       run: cargo test --verbose
