@@ -114,7 +114,7 @@ where
         unsafe {
             while self.test() {}
 
-            self.unsafe_write_string("(CONNECTED)\n\r");
+           // self.unsafe_write_string("(CONNECTED)\n\r");
             kprint!("Successfully connected to serial line.")
         }
     }
