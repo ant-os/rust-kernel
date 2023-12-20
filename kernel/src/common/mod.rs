@@ -1,6 +1,7 @@
 pub mod consts;
 pub mod io;
 pub mod macros;
+pub mod driver;
 use core::{simd::ptr::SimdConstPtr, ptr::NonNull, mem::{size_of_val, size_of}, sync::atomic::AtomicPtr, ops::Deref};
 
 pub use limine::*;
@@ -9,6 +10,9 @@ pub mod gdt;
 pub mod handler;
 
 pub type Unit = ();
+
+pub use x86_64::structures::idt::ExceptionVector;
+pub use x86_64::structures::idt::InterruptStackFrame;
 
 #[doc = "A [AtomicPtr] wrapper that implements [Deref]."]
 #[repr(transparent)]
@@ -57,6 +61,8 @@ unsafe impl TransmuteIntoPointer for usize { /* empty */ }
 unsafe impl<T: Sized> TransmuteInto<NonNullPtr<T>> for NonNull<T>{ /* empty */ }
 
 unsafe impl<T: Sized> TransmuteInto<AtomicPtr<T>> for AtomicRef<T> { /* empty */ }
+
+unsafe impl TransmuteInto<ExceptionVector> for u8 { /* empty */ }
 
 #[cfg(target_pointer_width = "64")]
 unsafe impl TransmuteInto<u64> for usize{ /* empty */ }

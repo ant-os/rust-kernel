@@ -38,6 +38,7 @@ pub mod graphics;
 pub mod kernel_logger;
 pub mod legacy_pic;
 pub mod memory;
+pub mod debug;
 pub mod paging;
 pub mod renderer;
 pub mod serial;
@@ -48,11 +49,13 @@ use alloc_impl as _;
 use paging::frame_allocator::PageFrameAllocator;
 use spin::Mutex;
 use x86_64::structures::idt::InterruptStackFrame;
+use x86_64::structures::paging::mapper::FlagUpdateError;
 use x86_64::structures::paging::page::PageRange;
-use x86_64::structures::paging::{Mapper, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
+use x86_64::structures::paging::{Mapper, PageTableFlags, PhysFrame, Size2MiB, Size4KiB, Page};
 use x86_64::{structures, PhysAddr, VirtAddr};
 
 use crate::alloc_impl::KERNEL_ALLOCATOR;
+use crate::common::driver::Driver;
 use crate::common::idt::{Idt, KERNEL_IDT};
 use crate::common::io::outb;
 use crate::common::*;
@@ -67,6 +70,7 @@ use crate::memory::{
 use crate::paging::table_manager::PageTableManager;
 use core::arch::asm;
 use core::ffi::CStr;
+use core::hint::unreachable_unchecked;
 use elf::endian::AnyEndian;
 use elf::segment::ProgramHeader;
 use memory::MemoryArea;
@@ -83,6 +87,8 @@ use core::ptr::NonNull;
 extern crate bitfield;
 use numtoa::NumToA;
 use renderer::Renderer;
+
+#[macro_use] extern crate antos_macros;
 
 static FRAMEBUFFERS_REQUEST: limine::FramebufferRequest = limine::FramebufferRequest::new(0);
 static TERMINAL_REQUEST: limine::TerminalRequest = limine::TerminalRequest::new(0);
@@ -147,6 +153,7 @@ lazy_static::lazy_static! {
         }
     };
 }
+
 
 #[derive(Debug, Clone, Copy)]
 enum OutlineSegment {
@@ -234,40 +241,273 @@ struct Person {
     name: &'static str,
 }
 
-pub type InterruptParams = (usize, *mut ());
+
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RegisterCapture {
+    pub rax: u64,
+    #[deprecated(note = "This register is used by LLVM.")]
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    #[deprecated(note = "This register is used by LLVM.")]
+    pub rbp: u64,
+    #[deprecated(note = "This register is used by LLVM.")]
+    pub rsp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+}
+
+
+pub static mut INTERRUPT_HANDLERS: [Option<unsafe fn(InterruptStackFrame, RegisterCapture)>; 255] = [None; 255];
+
+static mut RAX: u64 = 0;
+static mut RBX: u64 = 0;
+static mut RCX: u64 = 0;
+static mut RDX: u64 = 0;
+static mut RSI: u64 = 0;
+static mut RDI: u64 = 0;
+static mut RBP: u64 = 0;
+static mut RSP: u64 = 0;
+static mut R8:  u64 = 0;
+static mut R9:  u64 = 0;
+static mut R10: u64 = 0;
+static mut R11: u64 = 0;
+static mut R12: u64 = 0;
+static mut R13: u64 = 0;
+static mut R14: u64 = 0;
+static mut R15: u64 = 0;
+
+/// Captures the Registers of the CPU.
+/// 
+/// ## Safety
+/// 
+/// This macro is unsafe because it uses inline assembly.
+/// 
+/// ## Returns
+/// 
+/// The Captured Registers.
+/// 
+/// ## Usage
+/// 
+/// ```rust
+/// let registers = unsafe { capture_registers!() };
+/// ```
+/// 
+/// ## Related
+/// 
+/// See [`RegisterCapture`] for more info.
+/// 
+/// [`RegisterCapture`]: kernel::RegisterCapture
+pub macro capture_registers() {
+    {
+        ::core::arch::asm!("#CAPTURE_REGISTERS", out("rax") RAX, out("rcx") RCX, out("rdx") RDX, out("rsi") RSI, out("rdi") RDI, out("r8") R8, out("r9") R9, out("r10") R10, out("r11") R11, out("r12") R12, out("r13") R13, out("r14") R14, out("r15") R15, options(nostack, nomem, preserves_flags));
+
+        RegisterCapture {
+            rax: RAX,
+            rbx: RBX,
+            rcx: RCX,
+            rdx: RDX,
+            rsi: RSI,
+            rdi: RDI,
+            rbp: RBP,
+            rsp: RSP,
+            r8: R8,
+            r9: R9,
+            r10: R10,
+            r11: R11,
+            r12: R12,
+            r13: R13,
+            r14: R14,
+            r15: R15,
+        }
+    }
+}
+
+///  Apply Registers and Return from Interrupt.
+/// ===========================================
+/// 
+/// ## Arguments
+/// 
+/// * `registers` - The Registers to apply.
+/// * `capture` - The Capture to apply the Registers from.
+/// * `frame` - The Interrupt Stack Frame.
+/// 
+/// ## Safety
+/// This macro is unsafe because it uses inline assembly.
+/// 
+/// See [`InterruptStackFrame::iretq`] for more info.
+/// 
+/// See [`__capture_set_registers`] for more info.
+/// 
+pub macro kernelcall_ret([$($reg:ident)*], $capture:expr, $frame:expr) {
+    ::antos_macros::__capture_set_registers!(($($reg),*), $capture);
+    $frame.iretq(); // Return from Interrupt.
+}
+
+/// The Binding for the [`print`] Kernelcall.
+/// 
+/// # Arguments
+/// 
+/// * `buffer` - The Buffer to print.
+/// * `len` - The Length of the Buffer.
+/// 
+/// # Safety
+/// 
+/// This function is unsafe because it uses inline assembly.
+/// 
+/// # Returns
+/// 
+/// The Status of the Kernelcall.
+/// 
+/// # Usage
+/// 
+/// To use this function, you have to call it with inline assembly or use AntOS's Kernel Bindings.
+/// 
+/// ## Example
+/// 
+/// ```asm
+/// mov r9, A_POINTER_TO_THE_STRING
+/// mov r10, THE_LENGTH_OF_THE_STRING
+/// mov r8, 0x6
+/// int 0x80
+/// ```
+/// 
+/// This will call the [`print`] Kernelcall.
+/// 
+/// [`print`]: kernelcall.print.html
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn __kernelcall_print(buffer: *const u8, len: u64) -> u64 {
+    let mut status: u64;
+    asm!(
+        "mov r8, 0x6",
+        "int 0x80",
+        in("r9") buffer,
+        in("r10") len,
+        lateout("r8") status,
+    );
+    status
+}
+
+pub unsafe fn example_interrupt_handler(_frame: InterruptStackFrame, _capture: RegisterCapture) {
+    let mut response = _capture;
+    response.rdx = 0x1337;
+    
+    kernelcall_ret!([rdx], response, _frame);
+}
+
+/// Kernelcall for printing to the Screen.
+/// This is the Kernel's Implementation of the [`print`] Kernelcall.
+/// 
+/// # Safety
+/// 
+/// This function is unsafe, but anything that could go wrong is handled by the Kernel.
+/// 
+/// # Related
+/// See [`print`] for more info.
+/// 
+/// [`print`]: kernelcall.print.html
+pub unsafe fn kernelcall_print(_frame: InterruptStackFrame, _capture: RegisterCapture) {
+    let mut response = _capture;
+    let string_ptr = response.r9 as *const u8;
+    let string_len = response.r10 as usize;
+
+    let string = core::slice::from_raw_parts(string_ptr, string_len);
+
+    let string = core::str::from_utf8_unchecked(string);
+
+    kprint!("{}", string);
+
+    response.r8 = 0x0; // Return 0x0 ( Success ).
+
+    kernelcall_ret!([r8], response, _frame);
+}
+
+
 
 #[no_mangle]
 pub extern "x86-interrupt" fn __irq_handler(_frame: InterruptStackFrame) {
-    let (mut r8, mut r9, mut r10): (u64, u64, u64);
+    let mut capture = unsafe { capture_registers!() };
+    
+    // The Index of the Interrupt Handler is stored in the AL Register.
+    let handler_index = (capture.r8) as u8;
+
+    if handler_index == 0 {
+        return;
+    }
+
+    if let Some(handler) = unsafe { INTERRUPT_HANDLERS[handler_index as usize] } {
+        unsafe { handler(_frame, capture) }; // Call the Interrupt Handler, it'll return from the Interrupt.
+        unreachable!("Interrupt Handler returned a value!") // The Interrupt Handler should never return.
+    } else {
+        panic!(
+            "Interrupt Handler for Index {} is not defined!",
+            handler_index
+        );
+    }
 }
 
 static mut has_panicked: bool = false;
 
-fn __generic_error_irq_handler(
+/// The Interrupt Handler for all Exceptions.
+/// This function is called when an Exception occurs.
+/// 
+/// # Arguments
+/// 
+/// * `stack_frame` - The Interrupt Stack Frame.
+/// * `exception_number` - The Exception Number.
+/// * `error_code` - The Error Code.
+/// 
+/// # Usage 
+/// This function is called by the **CPU**. It's not meant to be called manually.
+#[no_mangle]
+#[inline(never)]
+pub fn __generic_error_irq_handler(
     stack_frame: InterruptStackFrame,
-    index: u8,
+    exception_number: u8,
     error_code: Option<u64>,
 ) {
-    unsafe {
-        // Renderer::global_mut().clear(0xFF0000FF);
-        Renderer::global_mut().update_colors(Some(0xFF0000FF), Some(0xFF0000FF));
-        KERNEL_CONSOLE.cursor_pos = (1, 1);
-        KERNEL_CONSOLE.print("=== PANIC ===");
-        log::error!(
-            "A Exception has happend: ( error = {:?}, index = {:?}, frame = {:#?}",
-            error_code,
-            index,
-            stack_frame
-        );
-        kdebug!(
-            "A Exception has happend: ( error = {:?}, index = {:?}, frame = {:#?}",
-            error_code,
-            index,
-            stack_frame
-        );
+    let exception = unsafe { exception_number.transmute() };
+    match exception{
+        _ => {
+            unsafe {
+                if !has_panicked {
+                    has_panicked = true;
+                    panic!(
+                        "Exception: {:?}\nError Code: {:?}\nStack Frame: {:#?}",
+                        exception, error_code, stack_frame
+                    );
+                }
+            }
+        }
+    }
+}
 
-        hcf();
+pub fn kernel_memmap(virt_addr: VirtAddr, phys_addr: PhysAddr, size: usize, flags: PageTableFlags) {
+    use x86_64::structures::paging::PageTableFlags as Flags;
+    
+    let allocator = unsafe { &mut *KERNEL_FRAME_ALLOCATOR.lock() };
+
+    let page = Page::<Size4KiB>::containing_address(virt_addr);
+
+    let frame = PhysFrame::<Size4KiB>::containing_address(phys_addr);
+    let flags = flags;
+
+    let map_to_result = unsafe {
+        // FIXME: this is not safe, we do it only for testing
+        KERNEL_PAGE_MAPPER.lock().map_to(page, frame, flags, allocator)
     };
+    map_to_result.expect("map_to failed").flush();
 }
 
 #[no_mangle]
@@ -298,6 +538,7 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
 
     KERNEL_CONSOLE.newline();
 
+    
     kprint!("Console Successfully Initialized.\n");
 
     DEBUG_LINE.wait_for_connection();
@@ -411,19 +652,38 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
                         Ok(v) => v,
                     };
 
-                    KERNEL_PAGE_MAPPER.lock().update_flags(
-                        HugePage::from_start_address(
-                            VirtAddr::new(program_base.addr().transmute())
-                                .align_down(HugePage::SIZE),
+                    
+
+                    for page_index in (program_base as u64 / HugePage::SIZE)..((program_base as u64 + module.length as u64) / HugePage::SIZE){
+                        let page = HugePage::containing_address(VirtAddr::new((page_index as u64).saturating_mul(HugePage::SIZE)));
+
+
+            
+                        match KERNEL_PAGE_MAPPER.lock().update_flags(
+                            page,
+                            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE | PageTableFlags::BIT_55,
                         )
-                        .unwrap(),
-                        PageTableFlags::PRESENT | !PageTableFlags::NO_EXECUTE,
-                    );
+                        {
+                            Ok(flusher) => flusher.flush(),
+                            Err(FlagUpdateError::PageNotMapped) => {
+                                KERNEL_PAGE_MAPPER.lock().identity_map(
+                                    PhysFrame::<Size2MiB>::containing_address(PhysAddr::new(page_index as u64 * HugePage::SIZE)),
+                                    PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE | PageTableFlags::BIT_55,
+                                    &mut *KERNEL_FRAME_ALLOCATOR.lock(),
+                                ).unwrap().flush()
+                            }
+                            Err(e) => {
+                                log::error!("Error Updating Page Flags: {:#?}", e);
+                                break 'module;
+                            }
+                        }
+                    }
 
-                    // kdebug!("Program ELF: {:#?}", &bytes);
+                    log::debug!("Loaded Driver.");
 
-                    let start: *const unsafe extern "C" fn(KernelProgramMeta) =
-                        core::mem::transmute(program_base.addr() as u64 + bytes.ehdr.e_entry);
+                    let driver = Driver::from_raw_elf(program_base as u64, &bytes, "boot.driver.unknown");
+
+                 //    log::debug!("{}", driver.init());
                 }
             }
 
@@ -436,22 +696,44 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
     //let mut mapper = x86_64::structures::paging::RecursivePageTable::new(pml4_table)
     //    .expect("Failed to create Recursive Page Table Mapper.");
 
+    INTERRUPT_HANDLERS[0x1] = Some(example_interrupt_handler);
+    INTERRUPT_HANDLERS[0x6] = Some(kernelcall_print);
+
     asm!(
-        "mov r8w, 0x4",
-        "mov r9w, 0x6",
+        "mov r8, 0x1",
         options(raw, preserves_flags)
     );
     x86_64::software_interrupt!(0x80);
     let mut result: u16;
-    asm!("nop", out("r10w") result);
+    asm!("nop", out("rdx") result);
+
+    __kernelcall_print(
+        "Hello from the Kernel!\n\0".as_ptr(),
+        "Hello from the Kernel!\n\0".len() as u64,
+    );
+
+    for (i, e) in KERNEL_PAGE_MAPPER.lock().level_4_table().iter().enumerate() {
+        if !e.is_unused() {
+            kdebug!(
+                "Entry {}: {:#?}\n",
+                i,
+                e
+            );
+        }
+
+    }
 
     log::info!("Hello from the AntOS Kernel! ;)");
+
+    // Breakpoint for GDB.
+   // x86_64::instructions::interrupts::int3();
 
     // log::debug!("MemArea: {:#?}", pf_allocator!().request_memory_area(2000));
 
     DEBUG_LINE.unsafe_write_line("End of Runtime.");
 
     loop {
+        // GDB_PROTOCOL.lock().update();
         asm!("hlt");
     }
 }
@@ -474,18 +756,14 @@ macro_rules! halt_while {
 #[cfg(not(test))]
 #[panic_handler]
 fn rust_panic(_info: &core::panic::PanicInfo) -> ! {
+
     unsafe {
-        DEBUG_LINE.unsafe_write_line(
-            _info
-                .payload()
-                .downcast_ref::<&'_ str>()
-                .unwrap_or(&"Panic!" as &&'_ str),
-        );
+        kdebug!("A Rust Panic has occurred: \n{:#?}\n", _info);
+        
+        log::error!("A Rust Panic has occurred: \n{:#?}\n", _info.clone());
+        
+        hcf();
     }
-
-    log::error!("A Rust Panic has occurred: \n{:#?}\n", _info);
-
-    hcf();
 }
 fn hcf() -> ! {
     unsafe {
