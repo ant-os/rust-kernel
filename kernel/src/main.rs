@@ -7,6 +7,7 @@
     unboxed_closures,
     core_intrinsics,
     decl_macro,
+    never_type,
     ptr_from_ref,
     inherent_associated_types,
     adt_const_params,
@@ -43,6 +44,7 @@ pub mod graphics;
 pub mod kernel_logger;
 pub mod legacy_pic;
 pub mod memory;
+pub mod power;
 pub mod paging;
 pub mod renderer;
 pub mod rsdp;
@@ -65,6 +67,7 @@ use crate::memory::{
 };
 use crate::paging::table_manager::PageTableManager;
 use crate::rsdp::{Rsdp, RsdpBase};
+use acpi::PhysicalMapping;
 use alloc::collections::BTreeMap;
 use alloc::string::*;
 use alloc::{borrow::ToOwned, format, vec::Vec};
@@ -128,9 +131,9 @@ decl_uninit! {
 
 // Initalized all "pre-entry" variables.
 lazy_static::lazy_static! {
-    pub(crate) static ref RSDP_VALUE: &'static u8 = {
+    pub(crate) static ref RSDP_VALUE: usize = {
         if let Some(rsdp_resp) = RSDP_REQUEST.get_response().get(){
-            unsafe { rsdp_resp.address.get::<'static>().expect("Invalid RSDP Address")}
+            unsafe { rsdp_resp.address.as_ptr().expect("Invalid RSDP Pointer") as usize }
         }else{
             panic!("Cannot get RSDP");
         }
@@ -219,9 +222,11 @@ impl FontOutline {
     }
 }
 
-/// Restart with out checks... (e.g  [unreachable_unchecked])
+/// [8042 Restart](https://wiki.osdev.org/Reboot#Short_code_to_do_a_8042_reset) followed by [unreachable_unchecked].
 #[inline]
 pub unsafe fn reboot_unchecked() -> ! {
+    asm!("cli");
+
     let mut good: u8 = 0x02;
     while (good & 0x02) != 0 {
         good = inb(0x64);
@@ -325,6 +330,27 @@ fn __generic_error_irq_handler(
     };
 }
 
+#[derive(Clone, Debug, Copy)]
+struct StubMapper; // TODO: Don't use. :)
+
+impl acpi::AcpiHandler for StubMapper {
+    unsafe fn map_physical_region<T>(
+        &self,
+        physical_address: usize,
+        size: usize,
+    ) -> acpi::PhysicalMapping<Self, T> {
+        PhysicalMapping::new(
+            physical_address,
+            NonNull::new_unchecked(physical_address as *mut T),
+            size,
+            size,
+            self.clone(),
+        )
+    }
+
+    fn unmap_physical_region<T>(region: &acpi::PhysicalMapping<Self, T>) { /* empty */ }
+}
+
 #[repr(C)]
 pub struct DriverObject {}
 
@@ -392,9 +418,13 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
 
     SYSTEM_IDT.load();
 
-    let rsdp: &'static Rsdp = transmute(*RSDP_VALUE);
+    let rsdp_addr = (*RSDP_VALUE) as usize;
 
-    kdebug!("RSDP: {:#?}", rsdp.xsdp);
+    let acpi_tables = acpi::AcpiTables::from_rsdp(StubMapper, rsdp_addr).unwrap();
+
+    kdebug!("ACPI: {:#?}", acpi_tables.platform_info());
+
+    kdebug!("FADT: {:#?}", *acpi_tables.find_table::<acpi::fadt::Fadt>().unwrap());
 
     // outb(0xF0, io::inb(0xF0) | 0x100);
 
@@ -544,7 +574,9 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
                             .collect::<Vec<String>>()
                             .join("\r\n")
                     );
-                }
+                },
+                "reboot" => return power::KERNEL_POWER.request_reboot().unwrap(),
+                "shutdown" => return power::KERNEL_POWER.request_shutdown().unwrap(),
                 "cd" => {
                     let path = segments[1];
 
@@ -598,9 +630,7 @@ fn rust_panic(_info: &core::panic::PanicInfo) -> ! {
 
     log::error!("A Rust Panic has occurred: \n{:#?}\n", _info);
 
-    unsafe {
-        reboot_unchecked();
-    }
+    power::KERNEL_POWER.request_reboot().unwrap()
 }
 fn hcf() -> ! {
     unsafe {

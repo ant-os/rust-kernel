@@ -21,6 +21,7 @@ log = "0.4.20"
 serde = { version = "*", default-features = false, features = ["alloc", "derive"] }
 elf = { version = "0.7.4", default-features = false, features = ["nightly"] }
 flat_device_tree = "2.1.0"
+acpi = "5.0.0"
 
 
 # I really want to not do this.... but here we go...
