@@ -1,1 +1,1 @@
-/mnt/c/dev/rust-kernel/programs/example/target/x86_64-unknown-none/debug/example-program: /mnt/c/dev/rust-kernel/programs/example/src/main.rs
+/home/joscha/projects/antos/kernel/programs/example/target/x86_64-unknown-none/debug/example-program: /home/joscha/projects/antos/kernel/programs/example/build.rs /home/joscha/projects/antos/kernel/programs/example/linker.ld /home/joscha/projects/antos/kernel/programs/example/src/main.rs

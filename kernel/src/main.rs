@@ -1,7 +1,7 @@
 #![recursion_limit = "225"]
 #![cfg_attr(not(test), no_std)]
 #![no_main]
-#![allow(deprecated, incomplete_features, internal_features)]
+#![allow(deprecated, incomplete_features, internal_features, warnings)]
 #![feature(
     panic_info_message,
     unboxed_closures,
@@ -10,8 +10,12 @@
     ptr_from_ref,
     inherent_associated_types,
     adt_const_params,
+    ascii_char,
     abi_x86_interrupt,
     allocator_api,
+    const_for,
+    effects,
+    const_trait_impl,
     const_mut_refs,
     portable_simd,
     strict_provenance,
@@ -24,7 +28,8 @@
     asm_const,
     type_name_of_val,
     alloc_internals,
-    lazy_cell,
+    str_from_raw_parts,
+    lazy_cell
 )]
 
 extern crate alloc;
@@ -40,22 +45,16 @@ pub mod legacy_pic;
 pub mod memory;
 pub mod paging;
 pub mod renderer;
+pub mod rsdp;
 pub mod serial;
 pub mod status;
 pub mod tty;
-use alloc::format;
-use alloc_impl as _;
-use paging::frame_allocator::PageFrameAllocator;
-use spin::Mutex;
-use x86_64::structures::idt::InterruptStackFrame;
-use x86_64::structures::paging::page::PageRange;
-use x86_64::structures::paging::{Mapper, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
-use x86_64::{structures, PhysAddr, VirtAddr};
-
+pub mod vtree;
 use crate::alloc_impl::KERNEL_ALLOCATOR;
 use crate::common::idt::{Idt, KERNEL_IDT};
 use crate::common::io::outb;
 use crate::common::*;
+use crate::consts::PAGE_SIZE;
 use crate::device::{
     character::{TimedCharacterDevice, *},
     Device, GeneralDevice,
@@ -65,20 +64,38 @@ use crate::memory::{
     PHYSICAL_MEMORY_OFFSET,
 };
 use crate::paging::table_manager::PageTableManager;
+use crate::rsdp::{Rsdp, RsdpBase};
+use alloc::collections::BTreeMap;
+use alloc::string::*;
+use alloc::{borrow::ToOwned, format, vec::Vec};
+use alloc_impl as _;
+use common::io::inb;
 use core::arch::asm;
 use core::ffi::CStr;
+use core::hint::unreachable_unchecked;
+use core::ops::{Deref, Rem};
 use elf::endian::AnyEndian;
 use elf::segment::ProgramHeader;
+use heapless::sorted_linked_list::LinkedIndexUsize;
 use memory::MemoryArea;
+use paging::frame_allocator::PageFrameAllocator;
+use spin::Mutex;
 pub(crate) use tty::KERNEL_CONSOLE;
+
+use x86_64::structures::idt::{InterruptStackFrame, InterruptStackFrameValue};
+use x86_64::structures::paging::page::PageRange;
+use x86_64::structures::paging::{
+    FrameAllocator, Mapper, PageTableFlags, PhysFrame, Size2MiB, Size4KiB,
+};
+use x86_64::{structures, PhysAddr, VirtAddr};
 #[macro_use]
 use core::intrinsics::{likely, unlikely};
 #[macro_use]
 use core::fmt::*;
 use crate::paging::{pf_allocator, pt_manager, PageTable};
-use core::mem;
+use core::mem::{self, size_of, transmute};
 use core::num::NonZeroUsize;
-use core::ptr::NonNull;
+use core::ptr::{slice_from_raw_parts, NonNull};
 #[macro_use]
 extern crate bitfield;
 use numtoa::NumToA;
@@ -90,6 +107,11 @@ static MEMMAP_REQUEST: limine::MemmapRequest = limine::MemmapRequest::new(0);
 static KERNEL_ADDRESS_REQUEST: limine::KernelAddressRequest = limine::KernelAddressRequest::new(0);
 static KERNEL_FILE_REQUEST: limine::KernelFileRequest = limine::KernelFileRequest::new(0);
 static MODULE_REQUEST: limine::ModuleRequest = limine::ModuleRequest::new(0);
+static FDB_REQUEST: limine::DtbRequest = limine::DtbRequest::new(0);
+static SMP_REQUEST: limine::SmpRequest = limine::SmpRequest::new(0);
+static RSDP_REQUEST: limine::RsdpRequest = limine::RsdpRequest::new(0);
+
+static mut PROGRAM_INLINE: &[u8] = include_bytes!("../../PROGRAM.SYS");
 
 static mut SYSTEM_IDT: structures::idt::InterruptDescriptorTable =
     structures::idt::InterruptDescriptorTable::new();
@@ -104,7 +126,15 @@ decl_uninit! {
     ITOA_BUFFER => itoa::Buffer
 }
 
+// Initalized all "pre-entry" variables.
 lazy_static::lazy_static! {
+    pub(crate) static ref RSDP_VALUE: &'static u8 = {
+        if let Some(rsdp_resp) = RSDP_REQUEST.get_response().get(){
+            unsafe { rsdp_resp.address.get::<'static>().expect("Invalid RSDP Address")}
+        }else{
+            panic!("Cannot get RSDP");
+        }
+    };
     pub(crate) static ref FRAMEBUFFERS: &'static [NonNullPtr<limine::Framebuffer>] = {
         if let Some(fb_resp) = FRAMEBUFFERS_REQUEST.get_response().get(){
             unsafe { core::mem::transmute(fb_resp.framebuffers()) }
@@ -141,6 +171,7 @@ lazy_static::lazy_static! {
         if let Some(resp) = MEMMAP_REQUEST.get_response().get(){
             resp
         }else{
+
             debug_err!("Failed to get the list of System Framebuffers!");
             log::error!("Failed to get the list of System Framebuffers!");
             panic!("Failed to get the list of System Framebuffers!");
@@ -166,15 +197,8 @@ unsafe extern "C" fn __prog_debug_print(__base: *const u8, __len: usize) {
     )));
 }
 
-type DbgPrintFn = unsafe extern "C" fn(*const u8, usize);
-
 extern "x86-interrupt" fn handle_pit(_frame: InterruptStackFrame) {
     unsafe { kdebug!("Tick Tock") }
-}
-
-#[repr(C)]
-pub struct KernelProgramMeta {
-    _dbg_print: *const DbgPrintFn,
 }
 
 const MAX_FONT_OUTLINE_SEGMENTS: usize = 25;
@@ -193,6 +217,18 @@ impl FontOutline {
     pub fn push(&mut self, seg: OutlineSegment) {
         self.0.push(seg).expect("Failed to push Font Segment");
     }
+}
+
+/// Restart with out checks... (e.g  [unreachable_unchecked])
+#[inline]
+pub unsafe fn reboot_unchecked() -> ! {
+    let mut good: u8 = 0x02;
+    while (good & 0x02) != 0 {
+        good = inb(0x64);
+    }
+    outb(0x64, 0xfe);
+
+    unreachable_unchecked();
 }
 
 impl ttf_parser::OutlineBuilder for FontOutline {
@@ -238,7 +274,26 @@ pub type InterruptParams = (usize, *mut ());
 
 #[no_mangle]
 pub extern "x86-interrupt" fn __irq_handler(_frame: InterruptStackFrame) {
-    let (mut r8, mut r9, mut r10): (u64, u64, u64);
+    let mut ptr: *const u8;
+    let mut len: usize;
+
+    unsafe {
+        asm!(
+            "nop", out("r8w") ptr, out("r9w") len
+        );
+    }
+
+    unsafe {
+        kdebug!("kprint invoked.");
+    }
+
+    let string = unsafe { core::str::from_raw_parts(ptr, len) };
+
+    unsafe {
+        DEBUG_LINE.unsafe_write_string(string);
+    }
+
+    unsafe { _frame.iretq() };
 }
 
 static mut has_panicked: bool = false;
@@ -269,6 +324,9 @@ fn __generic_error_irq_handler(
         hcf();
     };
 }
+
+#[repr(C)]
+pub struct DriverObject {}
 
 #[no_mangle]
 unsafe extern "C" fn _start<'kernel>() -> ! {
@@ -321,19 +379,22 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
             endl!()
         );
     }
+    x86_64::set_general_handler!(&mut SYSTEM_IDT, __generic_error_irq_handler, 0..28);
 
     SYSTEM_IDT[0x80 as usize]
         .set_handler_fn(__irq_handler)
         .set_present(true)
         .set_privilege_level(x86_64::PrivilegeLevel::Ring0);
 
-    SYSTEM_IDT[0x20]
+    SYSTEM_IDT[0x30]
         .set_handler_fn(handle_pit)
         .set_present(true);
 
-    x86_64::set_general_handler!(&mut SYSTEM_IDT, __generic_error_irq_handler, 0..28);
-
     SYSTEM_IDT.load();
+
+    let rsdp: &'static Rsdp = transmute(*RSDP_VALUE);
+
+    kdebug!("RSDP: {:#?}", rsdp.xsdp);
 
     // outb(0xF0, io::inb(0xF0) | 0x100);
 
@@ -342,6 +403,10 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
     legacy_pic::PRIMARY_PIC.sync();
 
     kprint!("Successfully loaded Interrupt Descriptor Table.");
+
+    if let Some(smp_resp) = SMP_REQUEST.get_response().get() {
+        kdebug!("Found SMP: {:#?}", smp_resp);
+    }
 
     if let Some(module_response) = MODULE_REQUEST.get_response().get() {
         kprint!(
@@ -410,20 +475,16 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
                         }
                         Ok(v) => v,
                     };
+                    kdebug!("{:x?}\n", program_base.addr());
+                    kdebug!("{:x?}\n", program_base.addr() as u64 + bytes.ehdr.e_entry);
+                    kdebug!("{:x?}\n", bytes.dynamic_symbol_table());
 
-                    KERNEL_PAGE_MAPPER.lock().update_flags(
-                        HugePage::from_start_address(
-                            VirtAddr::new(program_base.addr().transmute())
-                                .align_down(HugePage::SIZE),
-                        )
-                        .unwrap(),
-                        PageTableFlags::PRESENT | !PageTableFlags::NO_EXECUTE,
-                    );
-
-                    // kdebug!("Program ELF: {:#?}", &bytes);
-
-                    let start: *const unsafe extern "C" fn(KernelProgramMeta) =
-                        core::mem::transmute(program_base.addr() as u64 + bytes.ehdr.e_entry);
+                    for page in KERNEL_PAGE_MAPPER.lock().level_4_table().iter() {
+                        if page.is_unused() {
+                            continue;
+                        }
+                        kdebug!("{:#?}", page);
+                    }
                 }
             }
 
@@ -436,24 +497,79 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
     //let mut mapper = x86_64::structures::paging::RecursivePageTable::new(pml4_table)
     //    .expect("Failed to create Recursive Page Table Mapper.");
 
-    asm!(
-        "mov r8w, 0x4",
-        "mov r9w, 0x6",
-        options(raw, preserves_flags)
-    );
-    x86_64::software_interrupt!(0x80);
-    let mut result: u16;
-    asm!("nop", out("r10w") result);
-
     log::info!("Hello from the AntOS Kernel! ;)");
 
     // log::debug!("MemArea: {:#?}", pf_allocator!().request_memory_area(2000));
 
-    DEBUG_LINE.unsafe_write_line("End of Runtime.");
+    let mut cwd = "//?/C:".to_string();
+
+    let mut vtree = vtree::VTree::new();
+
+    vtree
+        .nodes
+        .insert("?".to_owned(), vtree::Node::Directory(BTreeMap::new()));
+
+    vtree
+        .builder("?")
+        .unwrap()
+        .attach_or_update("C:".to_owned(), vtree::Node::Directory(BTreeMap::new()))
+        .attach_or_update(
+            "$MODULES$".to_owned(),
+            vtree::Node::Directory(BTreeMap::new()),
+        );
+
+    kdebug!("TreeRoot: {:?}", vtree.find("//?/").map(|n| n.children()));
 
     loop {
-        asm!("hlt");
+        kdebug!("{}>", cwd);
+        if let Some(line) = DEBUG_LINE.read_line() {
+            let segments = line.trim().split(' ').collect::<Vec<_>>();
+
+            if segments.len() == 0 {
+                continue;
+            }
+
+            match segments[0] {
+                "" => continue,
+                "ls" => {
+                    kdebug!(
+                        "{:?}\r\n",
+                        vtree
+                            .find(cwd.as_str())
+                            .expect("not found")
+                            .children()
+                            .iter()
+                            .cloned()
+                            .map(|(n, _)| n)
+                            .collect::<Vec<String>>()
+                            .join("\r\n")
+                    );
+                }
+                "cd" => {
+                    let path = segments[1];
+
+                    if path == ".." {
+                        cwd = {
+                            let mut parts =
+                                cwd.trim_end_matches('/').split('/').collect::<Vec<_>>();
+
+                            parts.pop();
+
+                            parts.join("/")
+                        };
+                    } else {
+                        cwd = path.to_string();
+                    };
+                }
+                "clear" => DEBUG_LINE.unsafe_write_string(r"\e[3J\ec"),
+                cmd => kdebug!("The command {:?} cannot be found.\r\n", cmd),
+            }
+        }
     }
+
+    DEBUG_LINE.unsafe_write_line("End of Runtime.");
+
+    // loop {}
 }
 
 pub fn boolean_to_str(value: bool) -> &'static str {
@@ -474,18 +590,17 @@ macro_rules! halt_while {
 #[cfg(not(test))]
 #[panic_handler]
 fn rust_panic(_info: &core::panic::PanicInfo) -> ! {
+    use core::{f32::NEG_INFINITY, hint::unreachable_unchecked};
+
     unsafe {
-        DEBUG_LINE.unsafe_write_line(
-            _info
-                .payload()
-                .downcast_ref::<&'_ str>()
-                .unwrap_or(&"Panic!" as &&'_ str),
-        );
+        kdebug!("The AntOS Kernel Panicked: \r\n{:#?}", _info);
     }
 
     log::error!("A Rust Panic has occurred: \n{:#?}\n", _info);
 
-    hcf();
+    unsafe {
+        reboot_unchecked();
+    }
 }
 fn hcf() -> ! {
     unsafe {

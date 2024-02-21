@@ -5,9 +5,9 @@ use core::ptr::{addr_of, NonNull};
 
 use crate::bitmap_font::{BitmapFont, DisplayChar};
 use crate::common::endl;
-use crate::tty::KERNEL_CONSOLE;
-use crate::{debug, assign_uninit};
 use crate::framebuffer::Framebuffer;
+use crate::tty::KERNEL_CONSOLE;
+use crate::{assign_uninit, debug};
 
 pub struct Renderer {
     target_fb: &'static Framebuffer,
@@ -17,14 +17,14 @@ pub struct Renderer {
     pub optional_font_scaling: Option<u64>,
 }
 
-fn align_number_to(num: usize, align: usize) -> usize{
+fn align_number_to(num: usize, align: usize) -> usize {
     num - (num % align)
 }
 
-fn mod_max(num: usize, max: usize) -> usize{
-    if num > max{
+fn mod_max(num: usize, max: usize) -> usize {
+    if num > max {
         max
-    }else {
+    } else {
         num
     }
 }
@@ -33,24 +33,21 @@ pub enum RendererError {
     OutOfBounds,
 }
 
-crate::decl_uninit!{
+crate::decl_uninit! {
     GLOBAL_RENDERER => Renderer
 }
 
-
-
 impl Renderer {
-
-    pub fn global<'a>() -> &'a Renderer{
+    pub fn global<'a>() -> &'a Renderer {
         unsafe { &*self::GLOBAL_RENDERER.as_ptr() }
     }
 
-    pub fn global_mut<'a>() -> &'a mut Renderer{
+    pub fn global_mut<'a>() -> &'a mut Renderer {
         unsafe { &mut *self::GLOBAL_RENDERER.as_mut_ptr() }
     }
 
-    pub fn make_global(self){
-        assign_uninit!{
+    pub fn make_global(self) {
+        assign_uninit! {
             GLOBAL_RENDERER (Renderer) <= self
         }
     }
@@ -68,17 +65,17 @@ impl Renderer {
         }
     }
 
-    pub fn get_font_scaling(&self) -> u64{
+    pub fn get_font_scaling(&self) -> u64 {
         self.optional_font_scaling.unwrap_or(10)
     }
 
-    
-
-    pub unsafe fn scroll(&mut self, amount: usize, align: usize){
-        let mut base = self.target_fb.address.as_ptr()
+    pub unsafe fn scroll(&mut self, amount: usize, align: usize) {
+        let mut base = self
+            .target_fb
+            .address
+            .as_ptr()
             .map(|p| core::mem::transmute::<*mut u8, *mut Color>(p))
             .unwrap();
-
 
         // 4 0
         let chunk_size = self.target_fb.width as usize * amount;
@@ -87,16 +84,30 @@ impl Renderer {
 
         base.copy_from(base.add(chunk_size), area_size);
 
-        Self::_fill_with_color(base.add(area_size), chunk_size, self.background_color, self.background_color)
+        Self::_fill_with_color(
+            base.add(area_size),
+            chunk_size,
+            self.background_color,
+            self.background_color,
+        )
     }
 
     pub unsafe fn clear(&self, color: Color) {
-        Self::_fill_with_color(self.target_fb.address.as_ptr().map(|p|core::mem::transmute::<*mut u8, *mut Color>(p)).unwrap(), (self.target_fb.height * self.target_fb.width) as usize, color, color);
+        Self::_fill_with_color(
+            self.target_fb
+                .address
+                .as_ptr()
+                .map(|p| core::mem::transmute::<*mut u8, *mut Color>(p))
+                .unwrap(),
+            (self.target_fb.height * self.target_fb.width) as usize,
+            color,
+            color,
+        );
     }
 
     pub unsafe fn unsafe_put_pixel(&self, x: usize, y: usize, color: Color) {
-        let mut pixel_offset = (mod_max(x, self.target_fb.width as usize) * 4) + self.target_fb.pitch as usize * mod_max(y, self.target_fb.height as usize);
-
+        let mut pixel_offset = (mod_max(x, self.target_fb.width as usize) * 4)
+            + self.target_fb.pitch as usize * mod_max(y, self.target_fb.height as usize);
 
         debug!(
             "unsafe_put_pixel( x=",
@@ -130,12 +141,12 @@ impl Renderer {
             .offset(pixel_offset as isize) as *mut Color)
     }
 
-    pub fn set_text_colors_via_invert(&mut self, color: Color){
+    pub fn set_text_colors_via_invert(&mut self, color: Color) {
         self.foreground_color = color;
         self.background_color = !color;
     }
 
-    pub fn update_colors(&mut self, fg_color: Option<Color>, bg_color: Option<Color>){
+    pub fn update_colors(&mut self, fg_color: Option<Color>, bg_color: Option<Color>) {
         self.foreground_color = fg_color.unwrap_or(self.foreground_color);
         self.background_color = bg_color.unwrap_or(self.background_color);
     }
@@ -153,19 +164,20 @@ impl Renderer {
         }
     }
 
-    pub unsafe fn unsafe_put_scaled_pixel(&self, x: usize, y: usize, color: Color){
+    pub unsafe fn unsafe_put_scaled_pixel(&self, x: usize, y: usize, color: Color) {
         let scaling = self.optional_font_scaling.unwrap_or(10) as usize;
 
-        self.unsafe_fill_square(
-            x * scaling,
-            y * scaling,
-            scaling,
-            scaling,
-            color
-        );
+        self.unsafe_fill_square(x * scaling, y * scaling, scaling, scaling, color);
     }
 
-   pub unsafe fn unsafe_draw_line(&self, x0: usize, y0: usize, x1: usize, y1: usize, color: Color) {
+    pub unsafe fn unsafe_draw_line(
+        &self,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+        color: Color,
+    ) {
         let dx = (x1 as isize - x0 as isize).abs();
         let dy = -(y1 as isize - y0 as isize).abs();
         let sx = if x0 < x1 { 1 as isize } else { -1 };
@@ -173,7 +185,7 @@ impl Renderer {
         let mut err = dx + dy;
         let mut x = x0 as isize;
         let mut y = y0 as isize;
-    
+
         while x != (x1 as isize) || y != (y1 as isize) {
             self.unsafe_put_scaled_pixel(x as usize, y as usize, color);
             let e2 = 2 * err;
@@ -187,7 +199,6 @@ impl Renderer {
             }
         }
     }
-    
 
     pub unsafe fn unsafe_fill_square(&self, x: usize, y: usize, w: usize, h: usize, color: Color) {
         for y_off in y..(y + h) {
@@ -205,8 +216,11 @@ impl Renderer {
         }
     }
 
-    pub fn dimensions(&self) -> (usize, usize){
-        (self.target_fb.width as usize, self.target_fb.height as usize)
+    pub fn dimensions(&self) -> (usize, usize) {
+        (
+            self.target_fb.width as usize,
+            self.target_fb.height as usize,
+        )
     }
 
     pub unsafe fn unsafe_draw_char(&self, off_x: usize, off_y: usize, chr: u8) -> usize {
@@ -232,28 +246,26 @@ impl Renderer {
         line_off
     }
 
-    pub unsafe fn draw_raw_image(&self, x: usize, y: usize, pixels: &'_ [u8]){
-        self.target_fb.address
+    pub unsafe fn draw_raw_image(&self, x: usize, y: usize, pixels: &'_ [u8]) {
+        self.target_fb
+            .address
             .as_ptr()
             .unwrap()
             .offset((x + (self.target_fb.pitch as usize * (y))) as isize)
             .copy_from(pixels.as_ptr(), pixels.len());
     }
-    
 
-
-    pub unsafe fn unsafe_draw_text(&self, x: usize, y: usize, text: &'_ str) -> usize{
+    pub unsafe fn unsafe_draw_text(&self, x: usize, y: usize, text: &'_ str) -> usize {
         let scaling = self.optional_font_scaling.unwrap_or(10) as usize;
         let mut line_off = 0usize;
 
         for (index, chr) in text.chars().enumerate() {
-            if chr == '\n'{
+            if chr == '\n' {
                 line_off += 1;
                 continue;
             }
 
             let x_off = x + (index * (16 * scaling));
-
 
             line_off += self.unsafe_draw_char(x_off, y + (line_off * 16), chr as u8);
         }

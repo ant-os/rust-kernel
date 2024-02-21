@@ -1,3 +1,5 @@
+use alloc::{alloc::alloc, string::String};
+
 #[macro_use]
 use crate::common::macros;
 use crate::common::io::{inb, io_wait, outb};
@@ -5,7 +7,7 @@ use crate::device::{
     character::{CharacterDeviceMode, TimedCharacterDevice, UnsafeCharacterDevice},
     Device, GeneralDevice,
 };
-use crate::kprint;
+use crate::{kdebug, kprint, DEBUG_LINE};
 
 pub enum Port {
     COM1 = 0x3F8,
@@ -133,5 +135,23 @@ where
     pub unsafe fn unsafe_read_string(&self, len: usize) -> &'static str {
         unimplemented!();
     }
-}
 
+    pub fn read_line(&self) -> Option<String> {
+        let mut builder = String::new();
+
+        loop {
+            let chr = unsafe { self.read() }.as_ascii()?.to_char(); // <--- Blocking
+
+            if !chr.is_ascii() {
+                return None;
+            }
+            if chr == '\n' {
+                break;
+            }
+
+            builder.push(chr);
+        }
+
+        Some(builder)
+    }
+}

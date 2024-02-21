@@ -1,4 +1,4 @@
-//! Legacy PIC.
+//! Legacy Programmable Interrupt Controller.
 
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -14,37 +14,37 @@ const ICW4_8086: u8 = 0x01;
 
 use bit::BitIndex;
 
-use super::io::{outb, inb, io_wait};
+use super::io::{inb, io_wait, outb};
 
-pub struct PIC{
+pub struct PIC {
     pub(self) master_mask: u8,
     pub(self) slave_mask: u8,
 }
 
 #[derive(Debug)]
-pub enum Interrupt{
-    PIT
+pub enum Interrupt {
+    PIT,
 }
 
-impl Interrupt{
-    pub fn enable_in(self, pic: &'_ mut PIC, value: bool){
-        match self{
-            Interrupt::PIT => {
-                pic.master_mask.set_bit(0, value)
-            }
-            _  => todo!()
+impl Interrupt {
+    pub fn enable_in(self, pic: &'_ mut PIC, value: bool) {
+        match self {
+            Interrupt::PIT => pic.master_mask.set_bit(0, !value),
+            _ => todo!(),
         };
-    } 
+    }
 }
 
-impl PIC{
-
+impl PIC {
     #[inline]
-    pub const fn new() -> Self{
-        Self { master_mask: 0x00, slave_mask: 0x00 }
+    pub const fn new() -> Self {
+        Self {
+            master_mask: 0x00,
+            slave_mask: 0x00,
+        }
     }
 
-    pub unsafe fn remap(&self){
+    pub unsafe fn remap(&self) {
         let a1 = inb(PIC1_DATA);
         io_wait();
         let a2 = inb(PIC2_DATA);
@@ -75,25 +75,26 @@ impl PIC{
         outb(PIC2_DATA, a2);
     }
 
-    pub unsafe fn needs_sync(&self) -> bool{
+    pub unsafe fn needs_sync(&self) -> bool {
         (self.master_mask != inb(PIC1_DATA)) || (self.slave_mask != inb(PIC2_DATA))
     }
 
     pub unsafe fn sync(&self) {
-    //   if !self.needs_sync() { return; }
+        if !self.needs_sync() {
+            return;
+        }
 
-    self.remap();
-    outb(PIC1_DATA, self.master_mask);
-    outb(PIC2_DATA, self.slave_mask);
-
-}
+        self.remap();
+        outb(PIC1_DATA, self.master_mask);
+        outb(PIC2_DATA, self.slave_mask);
+    }
 
     pub fn enable(&mut self, int: Interrupt) {
-        int.enable_in(self, false)
+        int.enable_in(self, true)
     }
 
     pub fn disable(&mut self, int: Interrupt) {
-        int.enable_in(self, true)
+        int.enable_in(self, false)
     }
 }
 
