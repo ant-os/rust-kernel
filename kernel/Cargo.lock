@@ -25,15 +25,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ansi_rgb"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a730095eb14ee842a0f1e68504b85c8d4a19b1ef2ac2a9b4debf0ed982f9b08a"
+dependencies = [
+ "rgb",
+]
+
+[[package]]
 name = "antos-kernel-minimal-generic"
 version = "0.1.0"
 dependencies = [
  "acpi",
+ "ansi_rgb",
  "bit",
  "bitfield",
  "bitflags",
  "bitmap",
+ "cmos-rtc",
  "elf",
+ "fatfs",
  "flat_device_tree",
  "git-version",
  "heapless",
@@ -87,6 +99,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e97e87564167fab42092c423e491e0fbb77b04ae02b5a78559a1396c052e01e9"
 
 [[package]]
+name = "bytemuck"
+version = "1.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2ef034f05691a48569bd920a96c81b9d91bbad1ab5ac7c4616c1f6ef36cb79f"
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -99,10 +117,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
+name = "cmos-rtc"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd109d8ba108f7420ce21f75e2278589ef91ef2ebd5641032bec8ffd5b8b572"
+dependencies = [
+ "x86_64",
+]
+
+[[package]]
 name = "elf"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4445909572dbd556c457c849c4ca58623d84b27c8fff1e74b0b4227d8b90d17b"
+
+[[package]]
+name = "fatfs"
+version = "0.4.0"
+source = "git+https://github.com/rafalh/rust-fatfs.git#1aa43f755572c6848fd981eafd11c02a4825dd62"
+dependencies = [
+ "bitflags",
+ "log",
+]
 
 [[package]]
 name = "flat_device_tree"
@@ -237,6 +273,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "291ec9ab5efd934aaf503a6466c5d5251535d108ee747472c3977cc5acc868ef"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "rgb"
+version = "0.8.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05aaa8004b64fd573fc9d002f4e632d51ad4f026c2b5ba95fcb6c2f32c2c47d8"
+dependencies = [
+ "bytemuck",
 ]
 
 [[package]]

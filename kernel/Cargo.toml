@@ -22,7 +22,9 @@ serde = { version = "*", default-features = false, features = ["alloc", "derive"
 elf = { version = "0.7.4", default-features = false, features = ["nightly"] }
 flat_device_tree = "2.1.0"
 acpi = "5.0.0"
-
+fatfs = { git = "https://github.com/rafalh/rust-fatfs.git", default-features = false, features = ["alloc"] }
+cmos-rtc = "0.1.2"
+ansi_rgb = "0.2.0"
 
 # I really want to not do this.... but here we go...
 x86_64 = "0.14.11"

@@ -39,13 +39,14 @@ pub mod alloc_impl;
 pub mod bitmap_font;
 pub mod common;
 pub mod device;
+pub mod fake_disk;
 pub mod framebuffer;
 pub mod graphics;
 pub mod kernel_logger;
 pub mod legacy_pic;
 pub mod memory;
-pub mod power;
 pub mod paging;
+pub mod power;
 pub mod renderer;
 pub mod rsdp;
 pub mod serial;
@@ -67,21 +68,29 @@ use crate::memory::{
 };
 use crate::paging::table_manager::PageTableManager;
 use crate::rsdp::{Rsdp, RsdpBase};
+use crate::vtree::vfs::{fname, Directory, Filename};
 use acpi::PhysicalMapping;
 use alloc::collections::BTreeMap;
 use alloc::string::*;
+use alloc::sync::Arc;
 use alloc::{borrow::ToOwned, format, vec::Vec};
 use alloc_impl as _;
+use ansi_rgb::{black, green, red, yellow, Foreground, WithForeground};
 use common::io::inb;
 use core::arch::asm;
 use core::ffi::CStr;
 use core::hint::unreachable_unchecked;
+use core::marker::ConstParamTy;
 use core::ops::{Deref, Rem};
+use core::panicking::panic;
 use elf::endian::AnyEndian;
 use elf::segment::ProgramHeader;
+use fatfs::FsOptions;
 use heapless::sorted_linked_list::LinkedIndexUsize;
 use memory::MemoryArea;
 use paging::frame_allocator::PageFrameAllocator;
+use serde::de::Expected;
+use spin::rwlock::RwLock;
 use spin::Mutex;
 pub(crate) use tty::KERNEL_CONSOLE;
 
@@ -98,7 +107,7 @@ use core::fmt::*;
 use crate::paging::{pf_allocator, pt_manager, PageTable};
 use core::mem::{self, size_of, transmute};
 use core::num::NonZeroUsize;
-use core::ptr::{slice_from_raw_parts, NonNull};
+use core::ptr::{null, slice_from_raw_parts, NonNull};
 #[macro_use]
 extern crate bitfield;
 use numtoa::NumToA;
@@ -180,7 +189,33 @@ lazy_static::lazy_static! {
             panic!("Failed to get the list of System Framebuffers!");
         }
     };
+    static ref KERNEL_VFS: RwLock<vtree::vfs::VirtualFilesystem> = RwLock::new(vtree::vfs::VirtualFilesystem::new());
 }
+
+#[derive(Eq, PartialEq, ConstParamTy)]
+enum OutputKind {
+    Normal,
+    Success,
+    Error,
+    Warning,
+}
+
+impl OutputKind {
+    pub const fn as_colored_str(&self) -> WithForeground<&str> {
+        match self {
+            Self::Error => "(ERROR) ".fg(red()),
+            Self::Success => "(OKAY) ".fg(green()),
+            Self::Warning => "(WARNING) ".fg(yellow()),
+            _ => "".fg(black()),
+        }
+    }
+}
+
+pub fn output<const KIND: OutputKind>(scoup: &'static str, msg: &'_ str) {
+    unsafe { kdebug!("[{}{}] {}\r\n", KIND.as_colored_str(), scoup, msg) }
+}
+
+pub const output_n: fn(&'static str, msg: &'_ str) = output::<{ OutputKind::Normal }>;
 
 #[derive(Debug, Clone, Copy)]
 enum OutlineSegment {
@@ -260,6 +295,7 @@ impl ttf_parser::OutlineBuilder for FontOutline {
 
 pub const FONT_BITMAP: bitmap_font::BitmapFont = include!("bitmap.raw");
 pub const DEBUG_LINE: serial::Port = serial::Port::COM1;
+pub const CMOS_RTC: cmos_rtc::ReadRTC = cmos_rtc::ReadRTC::new(24, 0);
 
 pub fn integer_to_string<'_str, I: itoa::Integer>(value: I) -> &'_str str {
     let mut buf = unsafe { &mut ITOA_BUFFER };
@@ -274,6 +310,9 @@ struct Person {
     age: i32,
     name: &'static str,
 }
+
+#[derive(Debug)]
+struct FakeDisk<'a>(pub &'a [u8], pub usize);
 
 pub type InterruptParams = (usize, *mut ());
 
@@ -348,7 +387,8 @@ impl acpi::AcpiHandler for StubMapper {
         )
     }
 
-    fn unmap_physical_region<T>(region: &acpi::PhysicalMapping<Self, T>) { /* empty */ }
+    fn unmap_physical_region<T>(region: &acpi::PhysicalMapping<Self, T>) { /* empty */
+    }
 }
 
 #[repr(C)]
@@ -372,19 +412,9 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
     kernel_renderer.optional_font_scaling = Some(2);
 
     Renderer::make_global(kernel_renderer);
-
-    kprint!(
-        "(c) 2023 Joscha Egloff & AntOS Project. See README.MD for more info.\n",
-        "AntOS Kernel ( ",
-        git_version::git_version!(),
-        " )"
-    );
+    DEBUG_LINE.wait_for_connection();
 
     KERNEL_CONSOLE.newline();
-
-    kprint!("Console Successfully Initialized.\n");
-
-    DEBUG_LINE.wait_for_connection();
 
     log::set_logger(&kernel_logger::KERNEL_LOGGER).unwrap();
     log::set_max_level(log::LevelFilter::Debug);
@@ -405,6 +435,9 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
             endl!()
         );
     }
+
+    output_n("Interrupts", "Found Global Descriptor Table");
+
     x86_64::set_general_handler!(&mut SYSTEM_IDT, __generic_error_irq_handler, 0..28);
 
     SYSTEM_IDT[0x80 as usize]
@@ -412,7 +445,7 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
         .set_present(true)
         .set_privilege_level(x86_64::PrivilegeLevel::Ring0);
 
-    SYSTEM_IDT[0x30]
+    SYSTEM_IDT[0x02]
         .set_handler_fn(handle_pit)
         .set_present(true);
 
@@ -422,9 +455,20 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
 
     let acpi_tables = acpi::AcpiTables::from_rsdp(StubMapper, rsdp_addr).unwrap();
 
-    kdebug!("ACPI: {:#?}", acpi_tables.platform_info());
+    output::<{ OutputKind::Success }>("ACPI", "Successfully found Root Tables.");
 
-    kdebug!("FADT: {:#?}", *acpi_tables.find_table::<acpi::fadt::Fadt>().unwrap());
+    let maybe_fadt = acpi_tables.find_table::<acpi::fadt::Fadt>().unwrap();
+
+    let century_reg = match maybe_fadt.century {
+        0 => {
+            output::<{ OutputKind::Warning }>(
+                "Real Time Clock",
+                "Century register not set, falling back to default...",
+            );
+            0
+        }
+        reg => reg,
+    };
 
     // outb(0xF0, io::inb(0xF0) | 0x100);
 
@@ -435,7 +479,10 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
     kprint!("Successfully loaded Interrupt Descriptor Table.");
 
     if let Some(smp_resp) = SMP_REQUEST.get_response().get() {
-        kdebug!("Found SMP: {:#?}", smp_resp);
+        output::<{ OutputKind::Success }>(
+            "Symmetric Multiprocessing",
+            "Successfully found Processor info",
+        )
     }
 
     if let Some(module_response) = MODULE_REQUEST.get_response().get() {
@@ -494,27 +541,20 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
                             " Segments!"
                         );
                     }
-                } else if path.contains(".SYS") {
-                    let program_base = module.base.as_ptr().expect("No Module Base");
-                    let program = core::slice::from_raw_parts(program_base, module.length as usize);
+                } else if path.ends_with("INITRD.SYS") {
+                    output_n("Init", "Found initial ramdisk...\r\n");
 
-                    let bytes = match elf::ElfBytes::<AnyEndian>::minimal_parse(program) {
-                        Err(e) => {
-                            log::error!("Error Parsing Program: {:#?}", e);
-                            break 'module;
-                        }
-                        Ok(v) => v,
-                    };
-                    kdebug!("{:x?}\n", program_base.addr());
-                    kdebug!("{:x?}\n", program_base.addr() as u64 + bytes.ehdr.e_entry);
-                    kdebug!("{:x?}\n", bytes.dynamic_symbol_table());
+                    let buffer = core::slice::from_raw_parts(
+                        module.base.as_ptr().unwrap(),
+                        module.length as usize,
+                    );
 
-                    for page in KERNEL_PAGE_MAPPER.lock().level_4_table().iter() {
-                        if page.is_unused() {
-                            continue;
-                        }
-                        kdebug!("{:#?}", page);
-                    }
+                    kdebug!("\tLoading Ramdisk...\r\n");
+
+                    output::<{ OutputKind::Error }>(
+                        "Init",
+                        "Failed to load initial ramdisk, not implemented.",
+                    )
                 }
             }
 
@@ -531,27 +571,28 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
 
     // log::debug!("MemArea: {:#?}", pf_allocator!().request_memory_area(2000));
 
-    let mut cwd = "//?/C:".to_string();
+    let mut cwd = "".to_string();
+    KERNEL_VFS
+        .write()
+        .root_mut()
+        .add_node(vtree::vfs::INode::new_file(fname("msg.txt"), null(), 12));
 
-    let mut vtree = vtree::VTree::new();
+    KERNEL_VFS
+        .write()
+        .root_mut()
+        .create_directory(fname("test"))
+        .expect("Failed to create directory")
+        .write_text_file(fname("hello.txt"), "Hello! :)")
+        .expect("Failed to create test file");
 
-    vtree
-        .nodes
-        .insert("?".to_owned(), vtree::Node::Directory(BTreeMap::new()));
-
-    vtree
-        .builder("?")
-        .unwrap()
-        .attach_or_update("C:".to_owned(), vtree::Node::Directory(BTreeMap::new()))
-        .attach_or_update(
-            "$MODULES$".to_owned(),
-            vtree::Node::Directory(BTreeMap::new()),
-        );
-
-    kdebug!("TreeRoot: {:?}", vtree.find("//?/").map(|n| n.children()));
+    kdebug!("VirtFS: {:#?}", KERNEL_VFS.read());
+    kdebug!(
+        "Root Nodes: {:#?}",
+        KERNEL_VFS.read().root().find_recursive("test/hello.txt")
+    );
 
     loop {
-        kdebug!("{}>", cwd);
+        kdebug!("[C:/{}>]$ ", cwd);
         if let Some(line) = DEBUG_LINE.read_line() {
             let segments = line.trim().split(' ').collect::<Vec<_>>();
 
@@ -562,36 +603,41 @@ unsafe extern "C" fn _start<'kernel>() -> ! {
             match segments[0] {
                 "" => continue,
                 "ls" => {
-                    kdebug!(
-                        "{:?}\r\n",
-                        vtree
-                            .find(cwd.as_str())
-                            .expect("not found")
-                            .children()
-                            .iter()
-                            .cloned()
-                            .map(|(n, _)| n)
-                            .collect::<Vec<String>>()
-                            .join("\r\n")
-                    );
+                    let mut cwd_real = KERNEL_VFS.read();
+                    let mut dir: &Directory = match cwd_real.root().find_recursive(cwd.as_str()){
+                        Some(node) => node.directory().unwrap_or(cwd_real.root()),
+                        None => continue,
+                    };
+
+                    for node in dir.node_slice().iter() {
+                        kdebug!(
+                            "{}\t{}\r\n",
+                            node.ty.descriptor(),
+                            node.name.iter().collect::<String>()
+                        )
+                    }
                 },
                 "reboot" => return power::KERNEL_POWER.request_reboot().unwrap(),
                 "shutdown" => return power::KERNEL_POWER.request_shutdown().unwrap(),
+                "time" => {
+                    let time = CMOS_RTC.read();
+
+                    kdebug!("{}:{}:{}\r\n", time.hour, time.minute, time.second);
+                },
+                "date" => {
+                    let time = CMOS_RTC.read();
+
+                    kdebug!("{}/{}/20{}\r\n", time.day, time.month, time.year);
+                },
+                "cwd" => kdebug!("{}", cwd),
                 "cd" => {
                     let path = segments[1];
-
-                    if path == ".." {
-                        cwd = {
-                            let mut parts =
-                                cwd.trim_end_matches('/').split('/').collect::<Vec<_>>();
-
-                            parts.pop();
-
-                            parts.join("/")
-                        };
-                    } else {
-                        cwd = path.to_string();
-                    };
+ 
+                    if path == "/"{
+                        cwd.clear();
+                    }else{
+                        cwd += format!("{}/", path).as_str();
+                    }
                 }
                 "clear" => DEBUG_LINE.unsafe_write_string(r"\e[3J\ec"),
                 cmd => kdebug!("The command {:?} cannot be found.\r\n", cmd),

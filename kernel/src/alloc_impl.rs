@@ -15,7 +15,7 @@ use limine::NonNullPtr;
 
 pub extern crate alloc;
 
-const ARENA_SIZE: usize = 558 * 1024;
+const ARENA_SIZE: usize = 2 * 558 * 1024;
 const MAX_SUPPORTED_ALIGN: usize = 4096;
 const FREE_BLOCKS_SIZE: usize = 8;
 
